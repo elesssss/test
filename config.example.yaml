@@ -1,0 +1,15 @@
+log_level: "info"   # debug / info / warn / error
+
+tunnels:         # 支持多组转发
+  - listen: "[::]:1017"        # 监听地址，支持 TCP & UDP
+    remote: "your-vps.com:1018"    # 境外出口服务器地址
+    sni: "bing.com"     # TLS 伪装域名
+    insecure: true     # 自签证书请保留本行；Let's Encrypt 请注释
+    password: "your-password-here"     # 必须与出站密码匹配
+
+  - listen: "[::]:1018"         # 监听地址，接受境内入口连接
+    remote: "your-target.com:1019"  # 目标服务器
+    sni: "bing.com"     # TLS 伪装域名
+    password: "your-password-here"     # 必须与入站密码匹配
+    cert: "/path/to/server.crt"     # 证书路径（自签 or Let's Encrypt）
+    key:  "/path/to/server.key"     # 私钥路径（自签 or Let's Encrypt）

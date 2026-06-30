@@ -1,0 +1,21 @@
+[package]
+name = "anyst"
+version = "0.1.0"
+edition = "2021"
+description = "A port tunnel with TCP (AnyTLS-like) and UDP (TUIC-like) support using shared TLS certificates"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
+quinn = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+bytes = "1"
+anyhow = "1"
+rustls-native-certs = "0.8"
+openssl = { version = "0.10", features = ["vendored"] }
