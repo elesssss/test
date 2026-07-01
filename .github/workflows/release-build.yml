@@ -2,8 +2,16 @@ name: Build and Release
 
 on:
   push:
+    # Tag push — e.g. `git tag v0.2.1 && git push origin v0.2.1`
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+*'   # v0.1.0, v1.2.3, v0.1.0-alpha, etc.
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+    # Branch push on main — fires when Cargo.toml is among the changed files
+    # (editing the version via GitHub web UI triggers this).
+    branches:
+      - main
+    paths:
+      - 'Cargo.toml'
+
   workflow_dispatch:
     inputs:
       version:
@@ -33,25 +41,55 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # needed for `git tag` / `git push --tags`
 
       # ── Determine version ──────────────────────────────────────────
       - name: Determine version
         id: version
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            # Manual trigger: use the provided version string.
+            # Manual trigger.
             echo "VERSION=${{ inputs.version }}" >> $GITHUB_OUTPUT
             echo "TAG_NAME=v${{ inputs.version }}" >> $GITHUB_OUTPUT
-          else
-            # Tag trigger: strip the leading 'v'.
+            echo "IS_TAG_PUSH=false" >> $GITHUB_OUTPUT
+
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            # Tag trigger.
             TAG="${{ github.ref_name }}"
             echo "VERSION=${TAG#v}" >> $GITHUB_OUTPUT
             echo "TAG_NAME=${TAG}" >> $GITHUB_OUTPUT
+            echo "IS_TAG_PUSH=true" >> $GITHUB_OUTPUT
+
+          else
+            # Cargo.toml push on main — read version from the file.
+            VER=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+            echo "VERSION=${VER}" >> $GITHUB_OUTPUT
+            echo "TAG_NAME=v${VER}" >> $GITHUB_OUTPUT
+            echo "IS_TAG_PUSH=false" >> $GITHUB_OUTPUT
           fi
 
-      # ── Verify Cargo.toml version matches the tag (tag‑trigger only) ─
+      # ── Auto‑create tag (Cargo.toml push only) ─────────────────────
+      # Pushing via the GITHUB_TOKEN does NOT trigger a recursive
+      # workflow run, so there is no infinite‑loop risk.
+      - name: Auto-create release tag
+        if: steps.version.outputs.IS_TAG_PUSH == 'false' && github.event_name != 'workflow_dispatch'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          TAG="${{ steps.version.outputs.TAG_NAME }}"
+          if git rev-parse "${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists — skipping creation."
+          else
+            git tag -a "${TAG}" -m "release: ${TAG}"
+            git push origin "${TAG}"
+            echo "Created and pushed tag: ${TAG}"
+          fi
+
+      # ── Verify version consistency (tag‑trigger only) ──────────────
       - name: Verify version consistency
-        if: github.event_name != 'workflow_dispatch'
+        if: steps.version.outputs.IS_TAG_PUSH == 'true'
         run: |
           CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
           TAG_VERSION="${{ steps.version.outputs.VERSION }}"
