@@ -79,13 +79,22 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           TAG="${{ steps.version.outputs.TAG_NAME }}"
+
+          # Check if the tag already exists locally …
           if git rev-parse "${TAG}" >/dev/null 2>&1; then
-            echo "Tag ${TAG} already exists — skipping creation."
-          else
-            git tag -a "${TAG}" -m "release: ${TAG}"
-            git push origin "${TAG}"
-            echo "Created and pushed tag: ${TAG}"
+            echo "Tag ${TAG} already exists locally — skipping creation."
+            exit 0
           fi
+
+          # … or on the remote (ls-remote fetches without touching local refs).
+          if git ls-remote --tags origin "${TAG}" | grep -q "${TAG}"; then
+            echo "Tag ${TAG} already exists on remote — skipping creation."
+            exit 0
+          fi
+
+          git tag -a "${TAG}" -m "release: ${TAG}"
+          git push origin "${TAG}"
+          echo "Created and pushed tag: ${TAG}"
 
       # ── Verify version consistency (tag‑trigger only) ──────────────
       - name: Verify version consistency
