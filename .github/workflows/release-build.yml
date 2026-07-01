@@ -135,7 +135,7 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.VERSION }}"
           BIN_NAME="anyst"
-          RELEASE_DIR="${BIN_NAME}-${VERSION}-${{ matrix.target }}"
+          RELEASE_DIR="${BIN_NAME}"
           mkdir -p "${RELEASE_DIR}"
 
           # Binary
