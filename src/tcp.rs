@@ -207,9 +207,11 @@ impl AnyTlsClient {
     fn new(cfg: &TunnelConfig) -> Result<Self> {
         Ok(Self {
             remote: cfg.remote.clone(),
-            sni: cfg.sni.clone().unwrap_or_else(|| {
+            sni: if cfg.sni.is_empty() {
                 cfg.remote.rsplit_once(':').map(|(h, _)| h.to_string()).unwrap_or_default()
-            }),
+            } else {
+                cfg.sni.clone()
+            },
             password: cfg.password.clone(),
             insecure: cfg.insecure,
             scheme: Arc::new(Mutex::new(PaddingScheme::default_scheme())),
@@ -381,9 +383,11 @@ impl AnyTlsClient {
             // Cap the idle pool to avoid unbounded accumulation during
             // bursts of short-lived connections between janitor runs.
             if pool.len() >= 16 {
-                // Evict the oldest session (front of Vec, since we push to back).
-                if let Some((_, evicted)) = pool.drain(..1).next() {
-                    drop(pool); // release lock before closing
+                // Collect into a local variable first so the drain iterator is
+                // dropped before we release the lock, avoiding the borrow conflict.
+                let evicted: Option<Arc<ClientSession>> = pool.drain(..1).next().map(|(_, s)| s);
+                if let Some(evicted) = evicted {
+                    drop(pool);
                     evicted.close().await;
                     return;
                 }
@@ -689,7 +693,7 @@ fn spawn_server_writer(mut tls_write: WriteHalf<TlsServerStream>) -> mpsc::Sende
 async fn run_server_stream(
     target: TcpStream,
     stream_id: u32,
-    write_tx: mpsc::UnboundedSender<Vec<u8>>,
+    write_tx: mpsc::Sender<Vec<u8>>,
     mut to_remote_rx: mpsc::Receiver<ServerStreamMsg>,
     streams: Arc<Mutex<HashMap<u32, ServerStream>>>,
 ) {
