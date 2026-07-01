@@ -87,10 +87,20 @@ const ERROR_BAD_COMMAND: u32 = 0xfffffff3;
 
 // ── Transport ───────────────────────────────────────────────────────────────
 
-/// Maximum UDP payload (in bytes) that fits in a single QUIC datagram without
-/// risking IP-level fragmentation.  Payloads larger than this are split into
-/// multiple TUIC Packet frames (FRAG_TOTAL > 1).
-const MAX_DATAGRAM_PAYLOAD: usize = 1200;
+/// Fallback datagram payload limit used when the QUIC connection hasn't
+/// completed path MTU discovery yet.  Once PMTUD settles,
+/// `conn.max_datagram_size()` provides the real limit, which is typically
+/// large enough (~1400 B) that most TUIC packets fit in a single datagram
+/// without fragmentation.
+const DEFAULT_DATAGRAM_PAYLOAD: usize = 1200;
+
+/// Queries the QUIC connection for its actual maximum datagram payload size.
+/// Falls back to `DEFAULT_DATAGRAM_PAYLOAD` while PMTUD is still in flight.
+fn datagram_payload_limit(conn: &Connection) -> usize {
+    conn.max_datagram_size()
+        .map(|max_dgram| max_dgram.saturating_sub(PACKET_HEADER_LEN))
+        .unwrap_or(DEFAULT_DATAGRAM_PAYLOAD)
+}
 
 /// Maximum number of in-flight incomplete reassembly buffers per assoc.
 /// When this limit is reached the oldest incomplete buffer is evicted to
@@ -218,17 +228,20 @@ fn build_packet(assoc_id: u16, pkt_id: u16, payload: &[u8]) -> Vec<u8> {
 }
 
 /// Splits a payload into one or more Packet frames, fragmenting when the
-/// payload exceeds `MAX_DATAGRAM_PAYLOAD`.
-fn build_packet_maybe_fragmented(assoc_id: u16, pkt_id: u16, payload: &[u8]) -> Vec<Vec<u8>> {
-    if payload.len() <= MAX_DATAGRAM_PAYLOAD {
+/// payload exceeds `max_payload`.  Callers should derive `max_payload` from
+/// `datagram_payload_limit(conn)` so that the fragmentation threshold
+/// reflects the actual QUIC path MTU instead of a conservative hard‑coded
+/// constant.
+fn build_packet_maybe_fragmented(assoc_id: u16, pkt_id: u16, payload: &[u8], max_payload: usize) -> Vec<Vec<u8>> {
+    if payload.len() <= max_payload {
         return vec![build_packet(assoc_id, pkt_id, payload)];
     }
     let frag_total =
-        ((payload.len() + MAX_DATAGRAM_PAYLOAD - 1) / MAX_DATAGRAM_PAYLOAD) as u8;
+        ((payload.len() + max_payload - 1) / max_payload) as u8;
     (0..frag_total)
         .map(|frag_id| {
-            let start = frag_id as usize * MAX_DATAGRAM_PAYLOAD;
-            let end = std::cmp::min(start + MAX_DATAGRAM_PAYLOAD, payload.len());
+            let start = frag_id as usize * max_payload;
+            let end = std::cmp::min(start + max_payload, payload.len());
             build_packet_fragment(assoc_id, pkt_id, frag_total, frag_id, &payload[start..end])
         })
         .collect()
@@ -373,13 +386,18 @@ pub async fn run_udp_server(config: &TunnelConfig) -> anyhow::Result<()> {
 /// Per‑assoc_id server‑side relay state.  The UDP socket is bound but never
 /// `.connect()`‑ed, so it behaves as a true full‑cone socket: it can accept a
 /// reply from any source address.
+///
+/// `state` bundles `mode` and `last_seen` behind a **single** `Mutex` so the
+/// hot path (one read + one write per Packet) acquires only one lock instead
+/// of two.
+struct AssocState {
+    mode: RelayMode,
+    last_seen: Instant,
+}
+
 struct ServerAssoc {
     sock: Arc<UdpSocket>,
-    last_seen: Mutex<Instant>,
-    /// Which transport mode the client is using for this assoc.  Set on the
-    /// first Packet and updated if the client later switches (the server
-    /// mirrors for each reply).
-    mode: Mutex<RelayMode>,
+    state: Mutex<AssocState>,
     /// Fragmented‑packet reassembly buffers, keyed by `pkt_id`.
     reassembly: Mutex<HashMap<u16, ReassemblyBuffer>>,
     /// Handle to the reply‑pump task spawned for this assoc.  Stored so the
@@ -392,8 +410,10 @@ impl ServerAssoc {
     fn new(sock: Arc<UdpSocket>, mode: RelayMode) -> Self {
         Self {
             sock,
-            last_seen: Mutex::new(Instant::now()),
-            mode: Mutex::new(mode),
+            state: Mutex::new(AssocState {
+                mode,
+                last_seen: Instant::now(),
+            }),
             reassembly: Mutex::new(HashMap::new()),
             reply_handle: Mutex::new(None),
         }
@@ -502,7 +522,7 @@ async fn handle_tuic_connection(
                 for (id, a) in map.iter() {
                     let mut reassembly = a.reassembly.lock().await;
                     reassembly.retain(|_, buf| !buf.is_stale());
-                    if a.last_seen.lock().await.elapsed() > DISSOCIATE_TIMEOUT {
+                    if a.state.lock().await.last_seen.elapsed() > DISSOCIATE_TIMEOUT {
                         stale.push(*id);
                     }
                 }
@@ -601,16 +621,19 @@ async fn dispatch_command(
                     let assocs2 = assocs.clone();
                     let assoc_for_pump = assoc.clone();
                     let reply_handle = tokio::spawn(async move {
+                        // Snapshot the datagram limit once — it is
+                        // stable after the QUIC handshake settles.
+                        let max_payload = datagram_payload_limit(&conn2);
                         let mut buf = vec![0u8; 65536];
                         loop {
                             match sock.recv_from(&mut buf).await {
                                 Ok((n, _from)) => {
                                     let mode =
-                                        *assoc_for_pump.mode.lock().await;
+                                        assoc_for_pump.state.lock().await.mode;
                                     let id = pkt_id_ctr2
                                         .fetch_add(1, Ordering::Relaxed);
                                     let frames = build_packet_maybe_fragmented(
-                                        assoc_id, id, &buf[..n],
+                                        assoc_id, id, &buf[..n], max_payload,
                                     );
                                     let mut ok = true;
                                     for pkt in frames {
@@ -638,12 +661,12 @@ async fn dispatch_command(
                 }
             };
 
-            // Update mode (client may switch transport mid‑session).
+            // Single lock for both mode + last_seen (hot‑path optimisation).
             {
-                let mut mode = assoc.mode.lock().await;
-                *mode = from_mode;
+                let mut state = assoc.state.lock().await;
+                state.mode = from_mode;
+                state.last_seen = Instant::now();
             }
-            *assoc.last_seen.lock().await = Instant::now();
 
             // ── Reassembly ────────────────────────────────────────────
             if frag_total == 1 {
@@ -901,6 +924,8 @@ async fn local_udp_to_quic(
     last_peer: Arc<Mutex<Option<SocketAddr>>>,
     relay_mode: RelayMode,
 ) {
+    // Snapshot once — stable after QUIC handshake.
+    let max_payload = datagram_payload_limit(&conn);
     let mut buf = vec![0u8; 65536];
     loop {
         let (n, peer) = match local.recv_from(&mut buf).await {
@@ -910,8 +935,8 @@ async fn local_udp_to_quic(
         *last_peer.lock().await = Some(peer);
         let id = pkt_id_ctr.fetch_add(1, Ordering::Relaxed);
 
-        // Fragment oversized payloads automatically.
-        let frames = build_packet_maybe_fragmented(assoc_id, id, &buf[..n]);
+        // Fragment oversized payloads using the runtime datagram limit.
+        let frames = build_packet_maybe_fragmented(assoc_id, id, &buf[..n], max_payload);
 
         match relay_mode {
             RelayMode::Datagram => {
