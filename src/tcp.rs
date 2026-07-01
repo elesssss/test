@@ -108,15 +108,39 @@ pub async fn run_tcp_client(cfg: &TunnelConfig) -> Result<()> {
         .with_context(|| format!("failed to bind TCP listen address {}", cfg.listen))?;
     tracing::info!("[anytls client] listening on {}", cfg.listen);
 
+    // JoinSet tracks per‑connection tasks for clean shutdown (sing‑box
+    // pattern: closing the listener cascades to all accepted connections).
+    let mut tasks = tokio::task::JoinSet::new();
+
     loop {
-        let (local, peer) = listener.accept().await?;
-        let client = client.clone();
-        tokio::spawn(async move {
-            if let Err(e) = client.handle_local_conn(local).await {
-                tracing::debug!("[anytls client] connection from {peer} ended: {e:#}");
+        tokio::select! {
+            accept = listener.accept() => {
+                let (local, peer) = match accept {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!("[anytls client] accept error: {e}");
+                        break;
+                    }
+                };
+                let client = client.clone();
+                tasks.spawn(async move {
+                    if let Err(e) = client.handle_local_conn(local).await {
+                        tracing::debug!("[anytls client] connection from {peer} ended: {e:#}");
+                    }
+                });
             }
-        });
+            // Periodically reap finished tasks.
+            _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                while tasks.try_join_next().is_some() {}
+            }
+        }
     }
+
+    // Listener exited — abort remaining tasks then let Drop clean up the
+    // idle pool and janitor.
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+    Ok(())
 }
 
 pub async fn run_tcp_server(cfg: &TunnelConfig) -> Result<()> {
@@ -134,24 +158,50 @@ pub async fn run_tcp_server(cfg: &TunnelConfig) -> Result<()> {
     let expected_auth = sha256_password(&cfg.password);
     let remote = Arc::new(cfg.remote.clone());
 
-    loop {
-        let (stream, peer) = listener.accept().await?;
-        let acceptor = acceptor.clone();
-        let remote = remote.clone();
+    // JoinSet tracks all per‑session tasks so they can be aborted when the
+    // listener exits (matching sing‑box: closing the listener cascades to
+    // close all accepted connections).
+    let mut tasks = tokio::task::JoinSet::new();
 
-        tokio::spawn(async move {
-            let tls = match acceptor.accept(stream).await {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::debug!("[anytls server] TLS handshake with {peer} failed: {e}");
-                    return;
-                }
-            };
-            if let Err(e) = serve_session(tls, expected_auth, remote).await {
-                tracing::debug!("[anytls server] session with {peer} ended: {e:#}");
+    loop {
+        tokio::select! {
+            accept = listener.accept() => {
+                let (stream, peer) = match accept {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!("[anytls server] accept error: {e}");
+                        break;
+                    }
+                };
+                let acceptor = acceptor.clone();
+                let remote = remote.clone();
+
+                tasks.spawn(async move {
+                    let tls = match acceptor.accept(stream).await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            tracing::debug!("[anytls server] TLS handshake with {peer} failed: {e}");
+                            return;
+                        }
+                    };
+                    if let Err(e) = serve_session(tls, expected_auth, remote).await {
+                        tracing::debug!("[anytls server] session with {peer} ended: {e:#}");
+                    }
+                });
             }
-        });
+            // Periodically reap finished tasks to avoid accumulating
+            // JoinHandle allocations.
+            _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                while tasks.try_join_next().is_some() {}
+            }
+        }
     }
+
+    // Listener exited — abort all remaining session tasks then close the
+    // idle pool (sing‑box cascade pattern).
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+    Ok(())
 }
 
 // ── Client: connection pool + session lifecycle ────────────────────────────
@@ -159,7 +209,7 @@ pub async fn run_tcp_server(cfg: &TunnelConfig) -> Result<()> {
 /// One open TLS session, possibly multiplexing several streams.
 struct ClientSession {
     write_tx: mpsc::Sender<Vec<u8>>,
-    streams: Mutex<HashMap<u32, mpsc::UnboundedSender<StreamEvent>>>,
+    streams: Mutex<HashMap<u32, mpsc::Sender<StreamEvent>>>,
     next_stream_id: AtomicU32,
     active_streams: AtomicU32,
     closed: AtomicBool,
@@ -201,6 +251,24 @@ struct AnyTlsClient {
     insecure: bool,
     scheme: Arc<Mutex<PaddingScheme>>,
     idle_pool: Mutex<Vec<(Instant, Arc<ClientSession>)>>,
+    /// Handle to the idle-session janitor.  Stored so the task can be
+    /// aborted when the client is dropped (matching sing‑box's
+    /// `common.Close(h.client)` cascade pattern).  Uses a sync mutex
+    /// because the handle is stored from a non‑async context.
+    janitor_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl Drop for AnyTlsClient {
+    fn drop(&mut self) {
+        // Abort the janitor first so it doesn't race with session cleanup
+        // (matching sing‑box: closing the client terminates its background
+        // goroutines).
+        if let Ok(mut guard) = self.janitor_handle.lock() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
+        }
+    }
 }
 
 impl AnyTlsClient {
@@ -216,14 +284,16 @@ impl AnyTlsClient {
             insecure: cfg.insecure,
             scheme: Arc::new(Mutex::new(PaddingScheme::default_scheme())),
             idle_pool: Mutex::new(Vec::new()),
+            janitor_handle: std::sync::Mutex::new(None),
         })
     }
 
     fn spawn_idle_janitor(self: Arc<Self>) {
-        tokio::spawn(async move {
+        let self2 = self.clone();
+        let handle = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(IDLE_CHECK_INTERVAL).await;
-                let mut pool = self.idle_pool.lock().await;
+                let mut pool = self2.idle_pool.lock().await;
                 let now = Instant::now();
                 // Oldest entries are at the front (push happens at the back);
                 // close+drop anything that has been idle too long.
@@ -238,6 +308,11 @@ impl AnyTlsClient {
                 *pool = keep;
             }
         });
+        // Store the handle so Drop can abort the task (sing‑box pattern:
+        // the Close() method terminates the background goroutine).
+        if let Ok(mut guard) = self.janitor_handle.lock() {
+            *guard = Some(handle);
+        }
     }
 
     /// Handle one local TCP connection: open a Stream (reusing an idle
@@ -254,12 +329,12 @@ impl AnyTlsClient {
     /// batched into a single write, matching the spec's "packet 1").
     async fn open_stream(
         self: &Arc<Self>,
-    ) -> Result<(Arc<ClientSession>, u32, mpsc::UnboundedReceiver<StreamEvent>)> {
+    ) -> Result<(Arc<ClientSession>, u32, mpsc::Receiver<StreamEvent>)> {
         let reused = self.idle_pool.lock().await.pop().map(|(_, s)| s);
 
         let (session, stream_id, rx) = if let Some(session) = reused {
             let stream_id = session.next_stream_id.fetch_add(1, Ordering::Relaxed);
-            let (tx, rx) = mpsc::unbounded_channel();
+            let (tx, rx) = mpsc::channel(256);
             session.streams.lock().await.insert(stream_id, tx);
             session.active_streams.fetch_add(1, Ordering::Relaxed);
             // Reused session already had cmdSettings sent; just open a stream.
@@ -297,7 +372,7 @@ impl AnyTlsClient {
 
     async fn dial_new_session(
         self: &Arc<Self>,
-    ) -> Result<(Arc<ClientSession>, u32, mpsc::UnboundedReceiver<StreamEvent>)> {
+    ) -> Result<(Arc<ClientSession>, u32, mpsc::Receiver<StreamEvent>)> {
         let tcp = TcpStream::connect(&self.remote)
             .await
             .with_context(|| format!("failed to connect to {}", self.remote))?;
@@ -341,7 +416,7 @@ impl AnyTlsClient {
 
         let writer_handle = tokio::spawn(client_writer_loop(tls_write, write_rx, self.scheme.clone()));
 
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(256);
         let stream_id = 1u32;
         session.streams.lock().await.insert(stream_id, tx);
 
@@ -467,17 +542,17 @@ async fn client_reader_loop(
                     } else {
                         Err(String::from_utf8_lossy(&data).to_string())
                     };
-                    let _ = tx.send(StreamEvent::SynAck(result));
+                    let _ = tx.send(StreamEvent::SynAck(result)).await;
                 }
             }
             CMD_PSH => {
                 if let Some(tx) = session.streams.lock().await.get(&stream_id) {
-                    let _ = tx.send(StreamEvent::Data(data));
+                    let _ = tx.send(StreamEvent::Data(data)).await;
                 }
             }
             CMD_FIN => {
                 if let Some(tx) = session.streams.lock().await.remove(&stream_id) {
-                    let _ = tx.send(StreamEvent::Fin);
+                    let _ = tx.send(StreamEvent::Fin).await;
                 }
             }
             CMD_ALERT => {
@@ -509,8 +584,19 @@ async fn client_reader_loop(
     }
 
     session.closed.store(true, Ordering::SeqCst);
-    for (_, tx) in session.streams.lock().await.drain() {
-        let _ = tx.send(StreamEvent::Fin);
+    // Collect senders first, drop the lock, then notify — avoids holding
+    // the streams mutex across potentially long `.await` points (the
+    // channel is now bounded so `send` may wait for the receiver to drain
+    // the backlog).
+    let senders: Vec<_> = session
+        .streams
+        .lock()
+        .await
+        .drain()
+        .map(|(_, tx)| tx)
+        .collect();
+    for tx in senders {
+        let _ = tx.send(StreamEvent::Fin).await;
     }
 }
 
@@ -521,7 +607,7 @@ async fn run_client_stream(
     client: Arc<AnyTlsClient>,
     session: Arc<ClientSession>,
     stream_id: u32,
-    mut rx: mpsc::UnboundedReceiver<StreamEvent>,
+    mut rx: mpsc::Receiver<StreamEvent>,
 ) {
     let (mut local_r, mut local_w) = tokio::io::split(local);
     let write_tx = session.write_tx.clone();
