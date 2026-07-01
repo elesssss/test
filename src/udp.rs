@@ -43,7 +43,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+// tokio::io traits not needed directly in udp.rs (quinn streams have their own API)
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -353,15 +353,17 @@ pub async fn run_udp_client(config: &TunnelConfig) -> anyhow::Result<()> {
     );
     info!("[TUIC client] listening on {} (plain UDP)", config.listen);
 
-    let quic_client_cfg = tls::build_quic_client_config(config.insecure)?;
+    let rustls_cfg = tls::build_rustls_client_config(config.insecure);
+    let quic_client_cfg = tls::build_quic_client_config(rustls_cfg)?;
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
         .context("failed to create QUIC client endpoint")?;
     endpoint.set_default_client_config(quic_client_cfg);
 
-    let sni = config
-        .sni
-        .clone()
-        .unwrap_or_else(|| config.remote.rsplit_once(':').map(|(h, _)| h.to_string()).unwrap_or_default());
+    let sni = if config.sni.is_empty() {
+        config.remote.rsplit_once(':').map(|(h, _)| h.to_string()).unwrap_or_default()
+    } else {
+        config.sni.clone()
+    };
 
     let remote_addr: SocketAddr = tokio::net::lookup_host(&config.remote)
         .await
