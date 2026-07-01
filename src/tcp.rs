@@ -158,13 +158,17 @@ pub async fn run_tcp_server(cfg: &TunnelConfig) -> Result<()> {
 
 /// One open TLS session, possibly multiplexing several streams.
 struct ClientSession {
-    write_tx: mpsc::UnboundedSender<Vec<u8>>,
+    write_tx: mpsc::Sender<Vec<u8>>,
     streams: Mutex<HashMap<u32, mpsc::UnboundedSender<StreamEvent>>>,
     next_stream_id: AtomicU32,
     active_streams: AtomicU32,
     closed: AtomicBool,
     reader_handle: Mutex<Option<JoinHandle<()>>>,
     writer_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Heartbeat task handle — aborted when the session is closed so that
+    /// the task does not hold an Arc<ClientSession> clone alive for up to
+    /// one extra HEARTBEAT_INTERVAL after the session has already ended.
+    heartbeat_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 enum StreamEvent {
@@ -182,6 +186,9 @@ impl ClientSession {
             h.abort();
         }
         if let Some(h) = self.writer_handle.lock().await.take() {
+            h.abort();
+        }
+        if let Some(h) = self.heartbeat_handle.lock().await.take() {
             h.abort();
         }
     }
@@ -255,7 +262,7 @@ impl AnyTlsClient {
             session.active_streams.fetch_add(1, Ordering::Relaxed);
             // Reused session already had cmdSettings sent; just open a stream.
             let frame = encode_frame(CMD_SYN, stream_id, &[]);
-            session.write_tx.send(frame).map_err(|_| anyhow!("session writer gone"))?;
+            session.write_tx.send(frame).await.map_err(|_| anyhow!("session writer gone"))?;
             (session, stream_id, rx)
         } else {
             self.dial_new_session().await?
@@ -266,9 +273,23 @@ impl AnyTlsClient {
         let synack = tokio::time::timeout(SYNACK_TIMEOUT, rx.recv()).await;
         match synack {
             Ok(Some(StreamEvent::SynAck(Ok(())))) => Ok((session, stream_id, rx)),
-            Ok(Some(StreamEvent::SynAck(Err(msg)))) => Err(anyhow!("server rejected stream: {msg}")),
-            Ok(Some(_)) | Ok(None) => Err(anyhow!("session closed before SYNACK")),
-            Err(_) => Err(anyhow!("timed out waiting for SYNACK")),
+            // Error paths: clean up the stream entry we already registered so
+            // that active_streams and the streams map stay consistent.
+            Ok(Some(StreamEvent::SynAck(Err(msg)))) => {
+                session.streams.lock().await.remove(&stream_id);
+                session.active_streams.fetch_sub(1, Ordering::Relaxed);
+                Err(anyhow!("server rejected stream: {msg}"))
+            }
+            Ok(Some(_)) | Ok(None) => {
+                session.streams.lock().await.remove(&stream_id);
+                session.active_streams.fetch_sub(1, Ordering::Relaxed);
+                Err(anyhow!("session closed before SYNACK"))
+            }
+            Err(_) => {
+                session.streams.lock().await.remove(&stream_id);
+                session.active_streams.fetch_sub(1, Ordering::Relaxed);
+                Err(anyhow!("timed out waiting for SYNACK"))
+            }
         }
     }
 
@@ -301,7 +322,10 @@ impl AnyTlsClient {
 
         let (tls_read, tls_write) = tokio::io::split(tls);
 
-        let (write_tx, write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        // Bounded channel: provides backpressure so that a slow TLS writer
+        // cannot cause frames to pile up in memory without limit.
+        // 64 frames × up to 16 KB each = up to ~1 MB peak per session.
+        let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(64);
         let session = Arc::new(ClientSession {
             write_tx,
             streams: Mutex::new(HashMap::new()),
@@ -310,6 +334,7 @@ impl AnyTlsClient {
             closed: AtomicBool::new(false),
             reader_handle: Mutex::new(None),
             writer_handle: Mutex::new(None),
+            heartbeat_handle: Mutex::new(None),
         });
 
         let writer_handle = tokio::spawn(client_writer_loop(tls_write, write_rx, self.scheme.clone()));
@@ -337,9 +362,11 @@ impl AnyTlsClient {
         session
             .write_tx
             .send(packet1)
+            .await
             .map_err(|_| anyhow!("session writer gone immediately after dial"))?;
 
-        spawn_heartbeat(session.clone());
+        let hb_handle = spawn_heartbeat(session.clone());
+        *session.heartbeat_handle.lock().await = Some(hb_handle);
 
         Ok((session, stream_id, rx))
     }
@@ -350,12 +377,23 @@ impl AnyTlsClient {
         }
         let remaining = session.active_streams.load(Ordering::Relaxed);
         if remaining == 0 {
-            self.idle_pool.lock().await.push((Instant::now(), session));
+            let mut pool = self.idle_pool.lock().await;
+            // Cap the idle pool to avoid unbounded accumulation during
+            // bursts of short-lived connections between janitor runs.
+            if pool.len() >= 16 {
+                // Evict the oldest session (front of Vec, since we push to back).
+                if let Some((_, evicted)) = pool.drain(..1).next() {
+                    drop(pool); // release lock before closing
+                    evicted.close().await;
+                    return;
+                }
+            }
+            pool.push((Instant::now(), session));
         }
     }
 }
 
-fn spawn_heartbeat(session: Arc<ClientSession>) {
+fn spawn_heartbeat(session: Arc<ClientSession>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(HEARTBEAT_INTERVAL).await;
@@ -363,11 +401,11 @@ fn spawn_heartbeat(session: Arc<ClientSession>) {
                 break;
             }
             let frame = encode_frame(CMD_HEART_REQUEST, 0, &[]);
-            if session.write_tx.send(frame).is_err() {
+            if session.write_tx.send(frame).await.is_err() {
                 break;
             }
         }
-    });
+    })
 }
 
 /// Client-side writer task: the single point through which every byte sent
@@ -376,7 +414,7 @@ fn spawn_heartbeat(session: Arc<ClientSession>) {
 /// TLS write, exactly as the spec defines "packet index").
 async fn client_writer_loop(
     mut tls_write: WriteHalf<TlsClientStream>,
-    mut write_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut write_rx: mpsc::Receiver<Vec<u8>>,
     scheme: Arc<Mutex<PaddingScheme>>,
 ) {
     let mut packet_index: u32 = 1; // packet 0 was the auth message, sent before this task started
@@ -457,7 +495,7 @@ async fn client_reader_loop(
                 }
             }
             CMD_HEART_REQUEST => {
-                let _ = session.write_tx.send(encode_frame(CMD_HEART_RESPONSE, 0, &[]));
+                let _ = session.write_tx.send(encode_frame(CMD_HEART_RESPONSE, 0, &[])).await;
             }
             CMD_HEART_RESPONSE | CMD_WASTE => {
                 // heartbeat ack / filler frame, nothing to do
@@ -491,13 +529,13 @@ async fn run_client_stream(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let frame = encode_frame(CMD_PSH, stream_id, &buf[..n]);
-                    if write_tx.send(frame).is_err() {
+                    if write_tx.send(frame).await.is_err() {
                         break;
                     }
                 }
             }
         }
-        let _ = write_tx.send(encode_frame(CMD_FIN, stream_id, &[]));
+        let _ = write_tx.send(encode_frame(CMD_FIN, stream_id, &[])).await;
     };
 
     let download = async move {
@@ -525,7 +563,7 @@ async fn run_client_stream(
 // ── Server: session dispatch + per-stream relay ────────────────────────────
 
 struct ServerStream {
-    to_remote_tx: mpsc::UnboundedSender<ServerStreamMsg>,
+    to_remote_tx: mpsc::Sender<ServerStreamMsg>,
 }
 
 enum ServerStreamMsg {
@@ -564,7 +602,7 @@ async fn serve_session(tls: TlsServerStream, expected_auth: [u8; 32], remote: Ar
                 settings_received = true;
                 tracing::debug!("[anytls server] client settings: {}", String::from_utf8_lossy(&data));
                 let reply = encode_frame(CMD_SERVER_SETTINGS, 0, b"v=2");
-                if write_tx.send(reply).is_err() {
+                if write_tx.send(reply).await.is_err() {
                     break;
                 }
             }
@@ -574,7 +612,7 @@ async fn serve_session(tls: TlsServerStream, expected_auth: [u8; 32], remote: Ar
                         CMD_ALERT,
                         0,
                         b"cmdSYN received before cmdSettings",
-                    ));
+                    )).await;
                     break;
                 }
                 let remote = remote.clone();
@@ -583,9 +621,9 @@ async fn serve_session(tls: TlsServerStream, expected_auth: [u8; 32], remote: Ar
 
                 match TcpStream::connect(remote.as_str()).await {
                     Ok(target) => {
-                        let (to_remote_tx, to_remote_rx) = mpsc::unbounded_channel();
+                        let (to_remote_tx, to_remote_rx) = mpsc::channel(64);
                         streams2.lock().await.insert(stream_id, ServerStream { to_remote_tx });
-                        let _ = write_tx2.send(encode_frame(CMD_SYNACK, stream_id, &[]));
+                        let _ = write_tx2.send(encode_frame(CMD_SYNACK, stream_id, &[])).await;
                         tokio::spawn(run_server_stream(
                             target,
                             stream_id,
@@ -596,22 +634,22 @@ async fn serve_session(tls: TlsServerStream, expected_auth: [u8; 32], remote: Ar
                     }
                     Err(e) => {
                         let msg = format!("failed to connect to target: {e}");
-                        let _ = write_tx2.send(encode_frame(CMD_SYNACK, stream_id, msg.as_bytes()));
+                        let _ = write_tx2.send(encode_frame(CMD_SYNACK, stream_id, msg.as_bytes())).await;
                     }
                 }
             }
             CMD_PSH => {
                 if let Some(s) = streams.lock().await.get(&stream_id) {
-                    let _ = s.to_remote_tx.send(ServerStreamMsg::Data(data));
+                    let _ = s.to_remote_tx.send(ServerStreamMsg::Data(data)).await;
                 }
             }
             CMD_FIN => {
                 if let Some(s) = streams.lock().await.remove(&stream_id) {
-                    let _ = s.to_remote_tx.send(ServerStreamMsg::Fin);
+                    let _ = s.to_remote_tx.send(ServerStreamMsg::Fin).await;
                 }
             }
             CMD_HEART_REQUEST => {
-                let _ = write_tx.send(encode_frame(CMD_HEART_RESPONSE, 0, &[]));
+                let _ = write_tx.send(encode_frame(CMD_HEART_RESPONSE, 0, &[])).await;
             }
             CMD_HEART_RESPONSE | CMD_WASTE => {}
             CMD_ALERT => {
@@ -623,7 +661,7 @@ async fn serve_session(tls: TlsServerStream, expected_auth: [u8; 32], remote: Ar
     }
 
     for (_, s) in streams.lock().await.drain() {
-        let _ = s.to_remote_tx.send(ServerStreamMsg::Fin);
+        let _ = s.to_remote_tx.send(ServerStreamMsg::Fin).await;
     }
     Ok(())
 }
@@ -631,8 +669,10 @@ async fn serve_session(tls: TlsServerStream, expected_auth: [u8; 32], remote: Ar
 /// Server→client direction is sent unpadded, matching upstream anytls-go's
 /// own current behaviour (see its FAQ: only the client→server direction is
 /// padded today).
-fn spawn_server_writer(mut tls_write: WriteHalf<TlsServerStream>) -> mpsc::UnboundedSender<Vec<u8>> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+fn spawn_server_writer(mut tls_write: WriteHalf<TlsServerStream>) -> mpsc::Sender<Vec<u8>> {
+    // Bounded: prevents unbounded memory growth when TLS write is slower
+    // than the rate at which frames are enqueued.
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
     tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
             if tls_write.write_all(&frame).await.is_err() {
@@ -650,7 +690,7 @@ async fn run_server_stream(
     target: TcpStream,
     stream_id: u32,
     write_tx: mpsc::UnboundedSender<Vec<u8>>,
-    mut to_remote_rx: mpsc::UnboundedReceiver<ServerStreamMsg>,
+    mut to_remote_rx: mpsc::Receiver<ServerStreamMsg>,
     streams: Arc<Mutex<HashMap<u32, ServerStream>>>,
 ) {
     let (mut target_r, mut target_w) = tokio::io::split(target);
@@ -663,13 +703,13 @@ async fn run_server_stream(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let frame = encode_frame(CMD_PSH, stream_id, &buf[..n]);
-                    if write_tx2.send(frame).is_err() {
+                    if write_tx2.send(frame).await.is_err() {
                         break;
                     }
                 }
             }
         }
-        let _ = write_tx2.send(encode_frame(CMD_FIN, stream_id, &[]));
+        let _ = write_tx2.send(encode_frame(CMD_FIN, stream_id, &[])).await;
     };
 
     let upload = async move {
