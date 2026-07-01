@@ -1,731 +1,511 @@
-//! TCP tunnel — AnyTLS working mechanism.
+//! UDP tunnel — TUIC v5 working mechanism.
 //!
-//! This mirrors the *mechanisms* that define AnyTLS as a protocol (not its
-//! exact wire bytes, since interop with the official anytls-go is not a
+//! Implements the *mechanisms* that define TUIC v5 as a protocol (not its
+//! exact wire bytes, since interop with tuic-client/tuic-server is not a
 //! goal here):
 //!
-//!   - Auth: `sha256(password)`(32) + `padding0_len`(u16 BE) + `padding0`,
-//!     sent right after the TLS handshake completes.
-//!   - Session frame: `cmd`(1) `streamId`(u32 BE) `len`(u16 BE) `data`,
-//!     multiplexing many proxied TCP connections ("streams") over one TLS
-//!     session.
-//!   - Full v1+v2 command set: cmdWaste / cmdSYN / cmdPSH / cmdFIN /
-//!     cmdSettings / cmdAlert / cmdUpdatePaddingScheme / cmdSYNACK /
-//!     cmdHeartRequest / cmdHeartResponse / cmdServerSettings.
-//!   - Client-side idle session pool: a finished session (0 active streams)
-//!     is kept around and reused for the next local connection instead of
-//!     dialing a new TLS handshake every time ("复用最新、清理最老").
-//!   - PaddingScheme (see `crate::padding`): the actual byte-shaping
-//!     mechanism that AnyTLS exists for, mitigating "TLS-in-TLS" nested
-//!     handshake fingerprinting.
+//!   - Authenticate: `VER(1)=5 | TYPE(1)=0 | UUID(16) | TOKEN(32)`, sent on
+//!     a **unidirectional** stream in parallel with relay traffic — true
+//!     0-RTT, no round trip required before the tunnel starts forwarding.
+//!   - TOKEN is derived with the real TLS Keying Material Exporter
+//!     (RFC 5705) from the live QUIC/TLS session via
+//!     `quinn::Connection::export_keying_material`, with
+//!     `label = UUID bytes`, `context = password bytes` — exactly the
+//!     mechanism the spec describes, not a static password hash.
+//!   - UUID is derived deterministically as `sha256(password)[..16]`, since
+//!     this project has no separate identity/credential store — both peers
+//!     compute the same value from the shared password.
+//!   - Packet: `TYPE(1)=2 | ASSOC_ID(2 BE) | PKT_ID(2 BE) | FRAG_TOTAL(1) |
+//!     FRAG_ID(1) | SIZE(2 BE) | ADDR | DATA`, sent as a QUIC datagram
+//!     (lossy path — the spec's "lossless via stream" variant is out of
+//!     scope here).
+//!   - Dissociate: `TYPE(1)=3 | ASSOC_ID(2 BE)`, sent on a short-lived
+//!     unidirectional stream when a local UDP "session" is considered done.
+//!   - Heartbeat: `TYPE(1)=4`, sent periodically as a QUIC datagram to keep
+//!     NAT state alive at the application layer.
+//!   - True full-cone server socket: the per-ASSOC_ID UDP socket is bound
+//!     but never `.connect()`-ed, so it can receive a reply from *any*
+//!     source address and relay it back — matching TUIC's actual NAT
+//!     traversal design, not an artificially restricted single-peer socket.
 //!
-//! Two deliberate scope differences from upstream anytls-go, both because
-//! `anyst` is a *fixed* port forwarder (the destination is set once in
-//! `remote:` in the YAML), not a dynamic SOCKS-style proxy:
-//!   - `cmdSYN` carries no SocksAddr — the server always dials its own
-//!     configured `remote`, so there is nothing for the client to negotiate.
-//!   - Like real anytls-go (see its own FAQ), only the client→server
-//!     direction is padded; server→client writes are sent unpadded.
+//! Scope difference from upstream TUIC, mirroring the TCP/AnyTLS side: this
+//! project is a *fixed* port forwarder (the destination is the tunnel's
+//! configured `remote`, not chosen per-packet by the client), so the ADDR
+//! field is always encoded as `None` and the server ignores it, always
+//! forwarding to its own configured `remote`.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::Context;
+use bytes::Bytes;
+use quinn::Connection;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
-use tokio::task::JoinHandle;
-use tokio_rustls::{TlsAcceptor, TlsConnector};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UdpSocket;
+use tokio::sync::Mutex;
+use tracing::{debug, error, info, warn};
 
 use crate::config::TunnelConfig;
-use crate::padding::{self, PaddingScheme};
 use crate::tls;
 
-type TlsClientStream = tokio_rustls::client::TlsStream<TcpStream>;
-type TlsServerStream = tokio_rustls::server::TlsStream<TcpStream>;
+// ── TUIC v5 command types ───────────────────────────────────────────────────
 
-// ── Commands ────────────────────────────────────────────────────────────────
+const TUIC_VERSION: u8 = 5;
+const TYPE_AUTHENTICATE: u8 = 0x00;
+const TYPE_PACKET: u8 = 0x02;
+const TYPE_DISSOCIATE: u8 = 0x03;
+const TYPE_HEARTBEAT: u8 = 0x04;
 
-const CMD_WASTE: u8 = 0;
-const CMD_SYN: u8 = 1;
-const CMD_PSH: u8 = 2;
-const CMD_FIN: u8 = 3;
-const CMD_SETTINGS: u8 = 4;
-const CMD_ALERT: u8 = 5;
-const CMD_UPDATE_PADDING_SCHEME: u8 = 6;
-const CMD_SYNACK: u8 = 7;
-const CMD_HEART_REQUEST: u8 = 8;
-const CMD_HEART_RESPONSE: u8 = 9;
-const CMD_SERVER_SETTINGS: u8 = 10;
+// Address type tags. TUIC's wire spec defines its own values for these; since
+// interop isn't a goal here, these are anyst's own convention (both ends of
+// this implementation agree, which is all that's required for mechanism
+// parity rather than byte-for-byte compatibility).
+const ADDR_NONE: u8 = 0xFF;
 
-const FRAME_HEADER_LEN: usize = 1 + 4 + 2; // cmd + streamId + len
+const PACKET_HEADER_LEN: usize = 1 + 2 + 2 + 1 + 1 + 2 + 1; // type+assoc+pkt+fragtot+fragid+size+addr(None)
+const DISSOCIATE_TIMEOUT: Duration = Duration::from_secs(60);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
-const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
-const IDLE_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
-const SYNACK_TIMEOUT: Duration = Duration::from_secs(10);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
-
-// ── Frame encode / decode ──────────────────────────────────────────────────
-
-fn encode_frame(cmd: u8, stream_id: u32, data: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(FRAME_HEADER_LEN + data.len());
-    buf.push(cmd);
-    buf.extend_from_slice(&stream_id.to_be_bytes());
-    buf.extend_from_slice(&(data.len() as u16).to_be_bytes());
-    buf.extend_from_slice(data);
-    buf
+fn derive_uuid(password: &str) -> [u8; 16] {
+    let hash = Sha256::digest(password.as_bytes());
+    hash[..16].try_into().unwrap()
 }
 
-async fn read_frame<R: AsyncReadExt + Unpin>(r: &mut R) -> std::io::Result<(u8, u32, Vec<u8>)> {
-    let mut hdr = [0u8; FRAME_HEADER_LEN];
-    r.read_exact(&mut hdr).await?;
-    let cmd = hdr[0];
-    let stream_id = u32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]);
-    let len = u16::from_be_bytes([hdr[5], hdr[6]]) as usize;
-    let mut data = vec![0u8; len];
-    if len > 0 {
-        r.read_exact(&mut data).await?;
+/// Derives the TUIC v5 auth token using the connection's own TLS exported
+/// keying material (RFC 5705), exactly as the real spec defines: label is
+/// the client's UUID, context is the raw shared password.
+fn derive_token(conn: &Connection, uuid: &[u8; 16], password: &str) -> anyhow::Result<[u8; 32]> {
+    let mut out = [0u8; 32];
+    conn.export_keying_material(&mut out, uuid, password.as_bytes())
+        .map_err(|e| anyhow::anyhow!("failed to export TLS keying material: {e:?}"))?;
+    Ok(out)
+}
+
+fn build_authenticate(uuid: &[u8; 16], token: &[u8; 32]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(2 + 16 + 32);
+    b.push(TUIC_VERSION);
+    b.push(TYPE_AUTHENTICATE);
+    b.extend_from_slice(uuid);
+    b.extend_from_slice(token);
+    b
+}
+
+fn build_packet(assoc_id: u16, pkt_id: u16, payload: &[u8]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(PACKET_HEADER_LEN + payload.len());
+    b.push(TYPE_PACKET);
+    b.extend_from_slice(&assoc_id.to_be_bytes());
+    b.extend_from_slice(&pkt_id.to_be_bytes());
+    b.push(1); // FRAG_TOTAL — fragmentation across multiple Packet frames is out of scope
+    b.push(0); // FRAG_ID
+    b.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    b.push(ADDR_NONE);
+    b.extend_from_slice(payload);
+    b
+}
+
+/// Parses a Packet frame, returning `(assoc_id, payload_slice)`.
+fn parse_packet(data: &[u8]) -> Option<(u16, &[u8])> {
+    if data.is_empty() || data[0] != TYPE_PACKET {
+        return None;
     }
-    Ok((cmd, stream_id, data))
-}
-
-fn sha256_password(password: &str) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(password.as_bytes());
-    hasher.finalize().into()
-}
-
-// ── Entry point ─────────────────────────────────────────────────────────────
-
-pub async fn run_tcp_client(cfg: &TunnelConfig) -> Result<()> {
-    let client = Arc::new(AnyTlsClient::new(cfg)?);
-    client.clone().spawn_idle_janitor();
-
-    let listener = TcpListener::bind(&cfg.listen)
-        .await
-        .with_context(|| format!("failed to bind TCP listen address {}", cfg.listen))?;
-    tracing::info!("[anytls client] listening on {}", cfg.listen);
-
-    loop {
-        let (local, peer) = listener.accept().await?;
-        let client = client.clone();
-        tokio::spawn(async move {
-            if let Err(e) = client.handle_local_conn(local).await {
-                tracing::debug!("[anytls client] connection from {peer} ended: {e:#}");
-            }
-        });
+    if data.len() < PACKET_HEADER_LEN {
+        return None;
     }
+    let assoc_id = u16::from_be_bytes([data[1], data[2]]);
+    let size = u16::from_be_bytes([data[7], data[8]]) as usize;
+    // ADDR is fixed-length ADDR_NONE (1 byte) in this implementation; a real
+    // TUIC-faithful parser would branch on the ADDR type byte here.
+    let payload_start = PACKET_HEADER_LEN;
+    if payload_start + size > data.len() {
+        return None;
+    }
+    Some((assoc_id, &data[payload_start..payload_start + size]))
 }
 
-pub async fn run_tcp_server(cfg: &TunnelConfig) -> Result<()> {
-    let cert = cfg.cert.as_ref().ok_or_else(|| anyhow!("server mode requires `cert`"))?;
-    let key = cfg.key.as_ref().ok_or_else(|| anyhow!("server mode requires `key`"))?;
+fn build_dissociate(assoc_id: u16) -> Vec<u8> {
+    let mut b = Vec::with_capacity(3);
+    b.push(TYPE_DISSOCIATE);
+    b.extend_from_slice(&assoc_id.to_be_bytes());
+    b
+}
 
-    let rustls_cfg = tls::build_rustls_server_config(cert, key)?;
-    let acceptor = TlsAcceptor::from(Arc::new(rustls_cfg));
+fn build_heartbeat() -> Vec<u8> {
+    vec![TYPE_HEARTBEAT]
+}
 
-    let listener = TcpListener::bind(&cfg.listen)
-        .await
-        .with_context(|| format!("failed to bind TCP listen address {}", cfg.listen))?;
-    tracing::info!("[anytls server] listening on {}", cfg.listen);
+// ── Server ───────────────────────────────────────────────────────────────────
 
-    let expected_auth = sha256_password(&cfg.password);
-    let remote = Arc::new(cfg.remote.clone());
+pub async fn run_udp_server(config: &TunnelConfig) -> anyhow::Result<()> {
+    let cert = config.cert.as_ref().context("server mode requires `cert`")?;
+    let key = config.key.as_ref().context("server mode requires `key`")?;
 
-    loop {
-        let (stream, peer) = listener.accept().await?;
-        let acceptor = acceptor.clone();
+    let rustls_config = tls::build_rustls_server_config(cert, key)?;
+    let quic_config = tls::build_quic_server_config(rustls_config)?;
+
+    let listen_addr: SocketAddr = config.listen.parse().context("invalid `listen` address")?;
+    let endpoint = quinn::Endpoint::server(quic_config, listen_addr)
+        .context("failed to bind QUIC endpoint")?;
+
+    info!("[TUIC server] listening on {listen_addr} (QUIC)");
+
+    let expected_uuid = derive_uuid(&config.password);
+    let password = Arc::new(config.password.clone());
+    let remote = Arc::new(config.remote.clone());
+
+    while let Some(incoming) = endpoint.accept().await {
+        let password = password.clone();
         let remote = remote.clone();
+        let peer = incoming.remote_address();
 
         tokio::spawn(async move {
-            let tls = match acceptor.accept(stream).await {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::debug!("[anytls server] TLS handshake with {peer} failed: {e}");
-                    return;
+            match incoming.await {
+                Ok(conn) => {
+                    if let Err(e) = handle_tuic_connection(conn, expected_uuid, password, remote).await {
+                        error!("[TUIC server] connection from {peer}: {e:#}");
+                    }
                 }
-            };
-            if let Err(e) = serve_session(tls, expected_auth, remote).await {
-                tracing::debug!("[anytls server] session with {peer} ended: {e:#}");
+                Err(e) => warn!("[TUIC server] QUIC handshake with {peer} failed: {e}"),
             }
         });
     }
+
+    Ok(())
 }
 
-// ── Client: connection pool + session lifecycle ────────────────────────────
-
-/// One open TLS session, possibly multiplexing several streams.
-struct ClientSession {
-    write_tx: mpsc::Sender<Vec<u8>>,
-    streams: Mutex<HashMap<u32, mpsc::UnboundedSender<StreamEvent>>>,
-    next_stream_id: AtomicU32,
-    active_streams: AtomicU32,
-    closed: AtomicBool,
-    reader_handle: Mutex<Option<JoinHandle<()>>>,
-    writer_handle: Mutex<Option<JoinHandle<()>>>,
-    /// Heartbeat task handle — aborted when the session is closed so that
-    /// the task does not hold an Arc<ClientSession> clone alive for up to
-    /// one extra HEARTBEAT_INTERVAL after the session has already ended.
-    heartbeat_handle: Mutex<Option<JoinHandle<()>>>,
+/// Per-assoc_id server-side relay state. The UDP socket is bound but never
+/// `.connect()`-ed, so it behaves as a true full-cone socket: it can accept
+/// a reply from any source address.
+struct ServerAssoc {
+    sock: Arc<UdpSocket>,
+    last_seen: Mutex<std::time::Instant>,
 }
 
-enum StreamEvent {
-    SynAck(std::result::Result<(), String>),
-    Data(Vec<u8>),
-    Fin,
-}
+async fn handle_tuic_connection(
+    conn: Connection,
+    expected_uuid: [u8; 16],
+    password: Arc<String>,
+    remote: Arc<String>,
+) -> anyhow::Result<()> {
+    let peer = conn.remote_address();
+    info!("[TUIC server] new QUIC connection from {peer}");
 
-impl ClientSession {
-    async fn close(&self) {
-        if self.closed.swap(true, Ordering::SeqCst) {
-            return; // already closed
-        }
-        if let Some(h) = self.reader_handle.lock().await.take() {
-            h.abort();
-        }
-        if let Some(h) = self.writer_handle.lock().await.take() {
-            h.abort();
-        }
-        if let Some(h) = self.heartbeat_handle.lock().await.take() {
-            h.abort();
-        }
+    // ── Authenticate, on a unidirectional stream (0-RTT: this races with
+    //    any Packet/datagram traffic the client may already be sending) ──
+    let mut auth_stream = conn.accept_uni().await.context("failed to accept auth stream")?;
+    let auth_data = auth_stream
+        .read_to_end(2 + 16 + 32)
+        .await
+        .context("failed to read Authenticate")?;
+
+    if auth_data.len() < 2 + 16 + 32 {
+        anyhow::bail!("truncated Authenticate from {peer}");
     }
-}
-
-struct AnyTlsClient {
-    remote: String,
-    sni: String,
-    password: String,
-    insecure: bool,
-    scheme: Arc<Mutex<PaddingScheme>>,
-    idle_pool: Mutex<Vec<(Instant, Arc<ClientSession>)>>,
-}
-
-impl AnyTlsClient {
-    fn new(cfg: &TunnelConfig) -> Result<Self> {
-        Ok(Self {
-            remote: cfg.remote.clone(),
-            sni: cfg.sni.clone().unwrap_or_else(|| {
-                cfg.remote.rsplit_once(':').map(|(h, _)| h.to_string()).unwrap_or_default()
-            }),
-            password: cfg.password.clone(),
-            insecure: cfg.insecure,
-            scheme: Arc::new(Mutex::new(PaddingScheme::default_scheme())),
-            idle_pool: Mutex::new(Vec::new()),
-        })
+    if auth_data[0] != TUIC_VERSION {
+        anyhow::bail!("unsupported TUIC version {} from {peer}", auth_data[0]);
     }
+    if auth_data[1] != TYPE_AUTHENTICATE {
+        anyhow::bail!("expected Authenticate, got type {} from {peer}", auth_data[1]);
+    }
+    let recv_uuid: [u8; 16] = auth_data[2..18].try_into().unwrap();
+    let recv_token: [u8; 32] = auth_data[18..50].try_into().unwrap();
 
-    fn spawn_idle_janitor(self: Arc<Self>) {
+    let expected_token = derive_token(&conn, &recv_uuid, &password)?;
+    if recv_uuid != expected_uuid || recv_token != expected_token {
+        anyhow::bail!("auth failed from {peer}");
+    }
+    info!("[TUIC server] auth ok from {peer}");
+
+    let assocs: Arc<Mutex<HashMap<u16, Arc<ServerAssoc>>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    // Background janitor: drop any assoc that's had no traffic for a while
+    // (mirrors the client's Dissociate, in case that frame is lost).
+    // Its handle is captured so it can be aborted once this connection ends,
+    // instead of leaking a task that loops forever for a dead connection.
+    let janitor_handle = {
+        let assocs = assocs.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(IDLE_CHECK_INTERVAL).await;
-                let mut pool = self.idle_pool.lock().await;
-                let now = Instant::now();
-                // Oldest entries are at the front (push happens at the back);
-                // close+drop anything that has been idle too long.
-                let mut keep = Vec::with_capacity(pool.len());
-                for (since, session) in pool.drain(..) {
-                    if now.duration_since(since) > IDLE_SESSION_TIMEOUT {
-                        session.close().await;
-                    } else {
-                        keep.push((since, session));
+                tokio::time::sleep(DISSOCIATE_TIMEOUT / 2).await;
+                let mut map = assocs.lock().await;
+                let mut stale = Vec::new();
+                for (id, a) in map.iter() {
+                    if a.last_seen.lock().await.elapsed() > DISSOCIATE_TIMEOUT {
+                        stale.push(*id);
                     }
                 }
-                *pool = keep;
-            }
-        });
-    }
-
-    /// Handle one local TCP connection: open a Stream (reusing an idle
-    /// session if one exists), relay bytes, then return the session to the
-    /// idle pool once finished.
-    async fn handle_local_conn(self: &Arc<Self>, local: TcpStream) -> Result<()> {
-        let (session, stream_id, rx) = self.open_stream().await?;
-        run_client_stream(local, self.clone(), session, stream_id, rx).await;
-        Ok(())
-    }
-
-    /// Reuse the most-recently-idled session if one is available, else dial
-    /// a brand-new TLS session (sending `cmdSettings` + the first `cmdSYN`
-    /// batched into a single write, matching the spec's "packet 1").
-    async fn open_stream(
-        self: &Arc<Self>,
-    ) -> Result<(Arc<ClientSession>, u32, mpsc::UnboundedReceiver<StreamEvent>)> {
-        let reused = self.idle_pool.lock().await.pop().map(|(_, s)| s);
-
-        let (session, stream_id, rx) = if let Some(session) = reused {
-            let stream_id = session.next_stream_id.fetch_add(1, Ordering::Relaxed);
-            let (tx, rx) = mpsc::unbounded_channel();
-            session.streams.lock().await.insert(stream_id, tx);
-            session.active_streams.fetch_add(1, Ordering::Relaxed);
-            // Reused session already had cmdSettings sent; just open a stream.
-            let frame = encode_frame(CMD_SYN, stream_id, &[]);
-            session.write_tx.send(frame).await.map_err(|_| anyhow!("session writer gone"))?;
-            (session, stream_id, rx)
-        } else {
-            self.dial_new_session().await?
-        };
-
-        // Wait for cmdSYNACK before handing the stream back to the caller.
-        let mut rx = rx;
-        let synack = tokio::time::timeout(SYNACK_TIMEOUT, rx.recv()).await;
-        match synack {
-            Ok(Some(StreamEvent::SynAck(Ok(())))) => Ok((session, stream_id, rx)),
-            // Error paths: clean up the stream entry we already registered so
-            // that active_streams and the streams map stay consistent.
-            Ok(Some(StreamEvent::SynAck(Err(msg)))) => {
-                session.streams.lock().await.remove(&stream_id);
-                session.active_streams.fetch_sub(1, Ordering::Relaxed);
-                Err(anyhow!("server rejected stream: {msg}"))
-            }
-            Ok(Some(_)) | Ok(None) => {
-                session.streams.lock().await.remove(&stream_id);
-                session.active_streams.fetch_sub(1, Ordering::Relaxed);
-                Err(anyhow!("session closed before SYNACK"))
-            }
-            Err(_) => {
-                session.streams.lock().await.remove(&stream_id);
-                session.active_streams.fetch_sub(1, Ordering::Relaxed);
-                Err(anyhow!("timed out waiting for SYNACK"))
-            }
-        }
-    }
-
-    async fn dial_new_session(
-        self: &Arc<Self>,
-    ) -> Result<(Arc<ClientSession>, u32, mpsc::UnboundedReceiver<StreamEvent>)> {
-        let tcp = TcpStream::connect(&self.remote)
-            .await
-            .with_context(|| format!("failed to connect to {}", self.remote))?;
-
-        let rustls_cfg = tls::build_rustls_client_config(self.insecure);
-        let connector = TlsConnector::from(Arc::new(rustls_cfg));
-        let server_name = rustls::pki_types::ServerName::try_from(self.sni.clone())
-            .map_err(|_| anyhow!("invalid SNI: {}", self.sni))?;
-        let mut tls = connector.connect(server_name, tcp).await.context("TLS handshake failed")?;
-
-        // ── Auth: sha256(password) + padding0_len + padding0 ──
-        let scheme_snapshot = self.scheme.lock().await.clone();
-        let auth_hash = sha256_password(&self.password);
-        let pad0_len = scheme_snapshot.padding0_len();
-        let mut pad0 = vec![0u8; pad0_len];
-        rand::Rng::fill(&mut rand::thread_rng(), pad0.as_mut_slice());
-
-        let mut auth_msg = Vec::with_capacity(32 + 2 + pad0_len);
-        auth_msg.extend_from_slice(&auth_hash);
-        auth_msg.extend_from_slice(&(pad0_len as u16).to_be_bytes());
-        auth_msg.extend_from_slice(&pad0);
-        tls.write_all(&auth_msg).await.context("failed to send auth")?;
-        tls.flush().await?;
-
-        let (tls_read, tls_write) = tokio::io::split(tls);
-
-        // Bounded channel: provides backpressure so that a slow TLS writer
-        // cannot cause frames to pile up in memory without limit.
-        // 64 frames × up to 16 KB each = up to ~1 MB peak per session.
-        let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(64);
-        let session = Arc::new(ClientSession {
-            write_tx,
-            streams: Mutex::new(HashMap::new()),
-            next_stream_id: AtomicU32::new(1),
-            active_streams: AtomicU32::new(1),
-            closed: AtomicBool::new(false),
-            reader_handle: Mutex::new(None),
-            writer_handle: Mutex::new(None),
-            heartbeat_handle: Mutex::new(None),
-        });
-
-        let writer_handle = tokio::spawn(client_writer_loop(tls_write, write_rx, self.scheme.clone()));
-
-        let (tx, rx) = mpsc::unbounded_channel();
-        let stream_id = 1u32;
-        session.streams.lock().await.insert(stream_id, tx);
-
-        let reader_handle = tokio::spawn(client_reader_loop(
-            tls_read,
-            session.clone(),
-            self.scheme.clone(),
-        ));
-
-        *session.reader_handle.lock().await = Some(reader_handle);
-        *session.writer_handle.lock().await = Some(writer_handle);
-
-        // Packet 1: cmdSettings + the first cmdSYN, batched into one write.
-        let settings_data = format!(
-            "v=2\nclient=anyst/0.1.0\npadding-md5={}\n",
-            scheme_snapshot.md5_hex()
-        );
-        let mut packet1 = encode_frame(CMD_SETTINGS, 0, settings_data.as_bytes());
-        packet1.extend_from_slice(&encode_frame(CMD_SYN, stream_id, &[]));
-        session
-            .write_tx
-            .send(packet1)
-            .await
-            .map_err(|_| anyhow!("session writer gone immediately after dial"))?;
-
-        let hb_handle = spawn_heartbeat(session.clone());
-        *session.heartbeat_handle.lock().await = Some(hb_handle);
-
-        Ok((session, stream_id, rx))
-    }
-
-    async fn release_session(&self, session: Arc<ClientSession>) {
-        if session.closed.load(Ordering::SeqCst) {
-            return;
-        }
-        let remaining = session.active_streams.load(Ordering::Relaxed);
-        if remaining == 0 {
-            let mut pool = self.idle_pool.lock().await;
-            // Cap the idle pool to avoid unbounded accumulation during
-            // bursts of short-lived connections between janitor runs.
-            if pool.len() >= 16 {
-                // Evict the oldest session (front of Vec, since we push to back).
-                if let Some((_, evicted)) = pool.drain(..1).next() {
-                    drop(pool); // release lock before closing
-                    evicted.close().await;
-                    return;
+                for id in stale {
+                    map.remove(&id);
                 }
             }
-            pool.push((Instant::now(), session));
-        }
-    }
-}
-
-fn spawn_heartbeat(session: Arc<ClientSession>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(HEARTBEAT_INTERVAL).await;
-            if session.closed.load(Ordering::SeqCst) {
-                break;
-            }
-            let frame = encode_frame(CMD_HEART_REQUEST, 0, &[]);
-            if session.write_tx.send(frame).await.is_err() {
-                break;
-            }
-        }
-    })
-}
-
-/// Client-side writer task: the single point through which every byte sent
-/// to this TLS session passes, so the PaddingScheme's per-packet counter is
-/// meaningful (it counts *calls to this loop*, i.e. calls to the underlying
-/// TLS write, exactly as the spec defines "packet index").
-async fn client_writer_loop(
-    mut tls_write: WriteHalf<TlsClientStream>,
-    mut write_rx: mpsc::Receiver<Vec<u8>>,
-    scheme: Arc<Mutex<PaddingScheme>>,
-) {
-    let mut packet_index: u32 = 1; // packet 0 was the auth message, sent before this task started
-    while let Some(data) = write_rx.recv().await {
-        let scheme_snapshot = scheme.lock().await.clone();
-        let chunks = padding::plan_write(&scheme_snapshot, packet_index, &data);
-        let mut ok = true;
-        for chunk in chunks {
-            let res = match chunk {
-                padding::Chunk::Real(bytes) => tls_write.write_all(bytes).await,
-                padding::Chunk::Waste(n) if n >= FRAME_HEADER_LEN => {
-                    let waste = encode_frame(CMD_WASTE, 0, &vec![0u8; n - FRAME_HEADER_LEN]);
-                    tls_write.write_all(&waste).await
-                }
-                padding::Chunk::Waste(_) => Ok(()), // shortfall too small to frame; negligible
-            };
-            if res.is_err() {
-                ok = false;
-                break;
-            }
-        }
-        if !ok || tls_write.flush().await.is_err() {
-            break;
-        }
-        packet_index = packet_index.saturating_add(1);
-    }
-}
-
-/// Client-side reader task: dispatches incoming session frames to the
-/// relevant stream, or handles session-level commands directly.
-async fn client_reader_loop(
-    mut tls_read: ReadHalf<TlsClientStream>,
-    session: Arc<ClientSession>,
-    scheme: Arc<Mutex<PaddingScheme>>,
-) {
-    loop {
-        let (cmd, stream_id, data) = match read_frame(&mut tls_read).await {
-            Ok(v) => v,
-            Err(_) => break,
-        };
-        match cmd {
-            CMD_SYNACK => {
-                if let Some(tx) = session.streams.lock().await.get(&stream_id) {
-                    let result = if data.is_empty() {
-                        Ok(())
-                    } else {
-                        Err(String::from_utf8_lossy(&data).to_string())
-                    };
-                    let _ = tx.send(StreamEvent::SynAck(result));
-                }
-            }
-            CMD_PSH => {
-                if let Some(tx) = session.streams.lock().await.get(&stream_id) {
-                    let _ = tx.send(StreamEvent::Data(data));
-                }
-            }
-            CMD_FIN => {
-                if let Some(tx) = session.streams.lock().await.remove(&stream_id) {
-                    let _ = tx.send(StreamEvent::Fin);
-                }
-            }
-            CMD_ALERT => {
-                tracing::warn!("[anytls client] server alert: {}", String::from_utf8_lossy(&data));
-                break;
-            }
-            CMD_SERVER_SETTINGS => {
-                tracing::debug!("[anytls client] server settings: {}", String::from_utf8_lossy(&data));
-            }
-            CMD_UPDATE_PADDING_SCHEME => {
-                if let Ok(text) = String::from_utf8(data) {
-                    match PaddingScheme::parse(&text) {
-                        Ok(new_scheme) => {
-                            *scheme.lock().await = new_scheme;
-                            tracing::info!("[anytls client] padding scheme updated by server");
-                        }
-                        Err(e) => tracing::warn!("[anytls client] bad padding scheme from server: {e}"),
-                    }
-                }
-            }
-            CMD_HEART_REQUEST => {
-                let _ = session.write_tx.send(encode_frame(CMD_HEART_RESPONSE, 0, &[])).await;
-            }
-            CMD_HEART_RESPONSE | CMD_WASTE => {
-                // heartbeat ack / filler frame, nothing to do
-            }
-            _ => {}
-        }
-    }
-
-    session.closed.store(true, Ordering::SeqCst);
-    for (_, tx) in session.streams.lock().await.drain() {
-        let _ = tx.send(StreamEvent::Fin);
-    }
-}
-
-/// Bridges one local TCP connection to its Stream's events, then returns the
-/// (now possibly idle) session to the client's pool.
-async fn run_client_stream(
-    local: TcpStream,
-    client: Arc<AnyTlsClient>,
-    session: Arc<ClientSession>,
-    stream_id: u32,
-    mut rx: mpsc::UnboundedReceiver<StreamEvent>,
-) {
-    let (mut local_r, mut local_w) = tokio::io::split(local);
-    let write_tx = session.write_tx.clone();
-
-    let upload = async move {
-        let mut buf = vec![0u8; 16 * 1024];
-        loop {
-            match local_r.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let frame = encode_frame(CMD_PSH, stream_id, &buf[..n]);
-                    if write_tx.send(frame).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-        let _ = write_tx.send(encode_frame(CMD_FIN, stream_id, &[])).await;
+        })
     };
 
-    let download = async move {
-        while let Some(ev) = rx.recv().await {
-            match ev {
-                StreamEvent::Data(data) => {
-                    if local_w.write_all(&data).await.is_err() {
-                        break;
-                    }
-                }
-                StreamEvent::Fin => break,
-                StreamEvent::SynAck(_) => {}
-            }
-        }
-        let _ = local_w.shutdown().await;
-    };
+    // Reader for QUIC datagrams: Packet (relay) and Heartbeat.
+    let result = run_datagram_loop(&conn, assocs.clone(), remote).await;
+    janitor_handle.abort();
 
-    tokio::join!(upload, download);
-
-    session.streams.lock().await.remove(&stream_id);
-    session.active_streams.fetch_sub(1, Ordering::Relaxed);
-    client.release_session(session).await;
-}
-
-// ── Server: session dispatch + per-stream relay ────────────────────────────
-
-struct ServerStream {
-    to_remote_tx: mpsc::Sender<ServerStreamMsg>,
-}
-
-enum ServerStreamMsg {
-    Data(Vec<u8>),
-    Fin,
-}
-
-/// One accepted TLS connection on the server side: validates auth, then
-/// dispatches session frames until the connection closes.
-async fn serve_session(tls: TlsServerStream, expected_auth: [u8; 32], remote: Arc<String>) -> Result<()> {
-    let (mut tls_read, tls_write) = tokio::io::split(tls);
-
-    // ── Auth ──
-    let mut auth_hash = [0u8; 32];
-    tls_read.read_exact(&mut auth_hash).await.context("failed to read auth hash")?;
-    let mut pad0_len_buf = [0u8; 2];
-    tls_read.read_exact(&mut pad0_len_buf).await.context("failed to read padding0 length")?;
-    let pad0_len = u16::from_be_bytes(pad0_len_buf) as usize;
-    let mut pad0 = vec![0u8; pad0_len];
-    if pad0_len > 0 {
-        tls_read.read_exact(&mut pad0).await.context("failed to read padding0")?;
-    }
-    if auth_hash != expected_auth {
-        return Err(anyhow!("authentication failed"));
-    }
-
-    let write_tx = spawn_server_writer(tls_write);
-    let streams: Arc<Mutex<HashMap<u32, ServerStream>>> = Arc::new(Mutex::new(HashMap::new()));
-    let mut settings_received = false;
-
-    loop {
-        let (cmd, stream_id, data) = read_frame(&mut tls_read).await?;
-
-        match cmd {
-            CMD_SETTINGS => {
-                settings_received = true;
-                tracing::debug!("[anytls server] client settings: {}", String::from_utf8_lossy(&data));
-                let reply = encode_frame(CMD_SERVER_SETTINGS, 0, b"v=2");
-                if write_tx.send(reply).await.is_err() {
-                    break;
-                }
-            }
-            CMD_SYN => {
-                if !settings_received {
-                    let _ = write_tx.send(encode_frame(
-                        CMD_ALERT,
-                        0,
-                        b"cmdSYN received before cmdSettings",
-                    )).await;
-                    break;
-                }
-                let remote = remote.clone();
-                let write_tx2 = write_tx.clone();
-                let streams2 = streams.clone();
-
-                match TcpStream::connect(remote.as_str()).await {
-                    Ok(target) => {
-                        let (to_remote_tx, to_remote_rx) = mpsc::channel(64);
-                        streams2.lock().await.insert(stream_id, ServerStream { to_remote_tx });
-                        let _ = write_tx2.send(encode_frame(CMD_SYNACK, stream_id, &[])).await;
-                        tokio::spawn(run_server_stream(
-                            target,
-                            stream_id,
-                            write_tx2,
-                            to_remote_rx,
-                            streams2,
-                        ));
-                    }
-                    Err(e) => {
-                        let msg = format!("failed to connect to target: {e}");
-                        let _ = write_tx2.send(encode_frame(CMD_SYNACK, stream_id, msg.as_bytes())).await;
-                    }
-                }
-            }
-            CMD_PSH => {
-                if let Some(s) = streams.lock().await.get(&stream_id) {
-                    let _ = s.to_remote_tx.send(ServerStreamMsg::Data(data)).await;
-                }
-            }
-            CMD_FIN => {
-                if let Some(s) = streams.lock().await.remove(&stream_id) {
-                    let _ = s.to_remote_tx.send(ServerStreamMsg::Fin).await;
-                }
-            }
-            CMD_HEART_REQUEST => {
-                let _ = write_tx.send(encode_frame(CMD_HEART_RESPONSE, 0, &[])).await;
-            }
-            CMD_HEART_RESPONSE | CMD_WASTE => {}
-            CMD_ALERT => {
-                tracing::warn!("[anytls server] client alert: {}", String::from_utf8_lossy(&data));
-                break;
-            }
-            _ => {}
-        }
-    }
-
-    for (_, s) in streams.lock().await.drain() {
-        let _ = s.to_remote_tx.send(ServerStreamMsg::Fin).await;
+    if let Err(e) = result {
+        debug!("[TUIC server] datagram loop: {e}");
     }
     Ok(())
 }
 
-/// Server→client direction is sent unpadded, matching upstream anytls-go's
-/// own current behaviour (see its FAQ: only the client→server direction is
-/// padded today).
-fn spawn_server_writer(mut tls_write: WriteHalf<TlsServerStream>) -> mpsc::Sender<Vec<u8>> {
-    // Bounded: prevents unbounded memory growth when TLS write is slower
-    // than the rate at which frames are enqueued.
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
-    tokio::spawn(async move {
-        while let Some(frame) = rx.recv().await {
-            if tls_write.write_all(&frame).await.is_err() {
-                break;
+async fn run_datagram_loop(
+    conn: &Connection,
+    assocs: Arc<Mutex<HashMap<u16, Arc<ServerAssoc>>>>,
+    remote: Arc<String>,
+) -> anyhow::Result<()> {
+    let pkt_id_ctr = Arc::new(AtomicU16::new(0));
+
+    loop {
+        let dgram = match conn.read_datagram().await {
+            Ok(d) => d,
+            Err(e) => return Err(anyhow::anyhow!("read_datagram: {e}")),
+        };
+        if dgram.is_empty() {
+            continue;
+        }
+        match dgram[0] {
+            TYPE_PACKET => {
+                let Some((assoc_id, payload)) = parse_packet(&dgram) else {
+                    warn!("[TUIC server] malformed Packet ({} bytes)", dgram.len());
+                    continue;
+                };
+
+                let assoc = {
+                    let mut map = assocs.lock().await;
+                    if let Some(a) = map.get(&assoc_id) {
+                        a.clone()
+                    } else {
+                        // New assoc_id: bind a fresh, unconnected (full-cone) socket.
+                        let sock = match UdpSocket::bind("0.0.0.0:0").await {
+                            Ok(s) => Arc::new(s),
+                            Err(e) => {
+                                warn!("[TUIC server] failed to bind assoc socket: {e}");
+                                continue;
+                            }
+                        };
+                        let assoc = Arc::new(ServerAssoc {
+                            sock: sock.clone(),
+                            last_seen: Mutex::new(std::time::Instant::now()),
+                        });
+                        map.insert(assoc_id, assoc.clone());
+
+                        // Spawn the reply pump for this assoc: any source that
+                        // replies on `sock` gets relayed back to the client,
+                        // tagged with this assoc_id (true full-cone behaviour).
+                        let conn2 = conn.clone();
+                        let pkt_id_ctr2 = pkt_id_ctr.clone();
+                        let assocs2 = assocs.clone();
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 65536];
+                            loop {
+                                match sock.recv_from(&mut buf).await {
+                                    Ok((n, _from)) => {
+                                        let id = pkt_id_ctr2.fetch_add(1, Ordering::Relaxed);
+                                        let pkt = build_packet(assoc_id, id, &buf[..n]);
+                                        if conn2.send_datagram(Bytes::from(pkt)).is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            assocs2.lock().await.remove(&assoc_id);
+                        });
+
+                        assoc
+                    }
+                };
+
+                *assoc.last_seen.lock().await = std::time::Instant::now();
+                if let Err(e) = assoc.sock.send_to(payload, remote.as_str()).await {
+                    warn!("[TUIC server] assoc {assoc_id} send to remote failed: {e}");
+                }
             }
-            if tls_write.flush().await.is_err() {
-                break;
+            TYPE_DISSOCIATE => {
+                if dgram.len() >= 3 {
+                    let assoc_id = u16::from_be_bytes([dgram[1], dgram[2]]);
+                    assocs.lock().await.remove(&assoc_id);
+                    debug!("[TUIC server] dissociate {assoc_id}");
+                }
+            }
+            TYPE_HEARTBEAT => {
+                debug!("[TUIC server] heartbeat from {}", conn.remote_address());
+            }
+            other => {
+                warn!("[TUIC server] unknown datagram type {other}");
             }
         }
-    });
-    tx
+    }
 }
 
-async fn run_server_stream(
-    target: TcpStream,
-    stream_id: u32,
-    write_tx: mpsc::UnboundedSender<Vec<u8>>,
-    mut to_remote_rx: mpsc::Receiver<ServerStreamMsg>,
-    streams: Arc<Mutex<HashMap<u32, ServerStream>>>,
+// ── Client ───────────────────────────────────────────────────────────────────
+
+pub async fn run_udp_client(config: &TunnelConfig) -> anyhow::Result<()> {
+    let local = Arc::new(
+        UdpSocket::bind(&config.listen)
+            .await
+            .with_context(|| format!("failed to bind UDP listen address {}", config.listen))?,
+    );
+    info!("[TUIC client] listening on {} (plain UDP)", config.listen);
+
+    let quic_client_cfg = tls::build_quic_client_config(config.insecure)?;
+    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
+        .context("failed to create QUIC client endpoint")?;
+    endpoint.set_default_client_config(quic_client_cfg);
+
+    let sni = config
+        .sni
+        .clone()
+        .unwrap_or_else(|| config.remote.rsplit_once(':').map(|(h, _)| h.to_string()).unwrap_or_default());
+
+    let remote_addr: SocketAddr = tokio::net::lookup_host(&config.remote)
+        .await
+        .with_context(|| format!("failed to resolve {}", config.remote))?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no address found for {}", config.remote))?;
+
+    info!("[TUIC client] connecting QUIC to {remote_addr} (sni={sni}) ...");
+    let conn = tokio::time::timeout(Duration::from_secs(10), async {
+        endpoint.connect(remote_addr, &sni)?.await.map_err(anyhow::Error::from)
+    })
+    .await
+    .context("QUIC connect timed out")??;
+    info!("[TUIC client] QUIC connected to {remote_addr}");
+
+    // ── Authenticate (unidirectional, sent and forgotten — 0-RTT) ──
+    let uuid = derive_uuid(&config.password);
+    let token = derive_token(&conn, &uuid, &config.password)?;
+    {
+        let mut s = conn.open_uni().await.context("failed to open auth stream")?;
+        s.write_all(&build_authenticate(&uuid, &token))
+            .await
+            .context("failed to write Authenticate")?;
+        s.finish().context("failed to finish auth stream")?;
+    }
+    info!("[TUIC client] auth ok");
+
+    let assoc_id: u16 = 1;
+    let pkt_id_ctr = Arc::new(AtomicU16::new(0));
+    let conn = Arc::new(conn);
+    // Shared between the two relay directions: `local_udp_to_quic` updates
+    // this every time it sees a datagram from the local client, and
+    // `quic_to_local_udp` reads it to know where to write replies back to.
+    let last_peer: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+
+    // Heartbeat: keep NAT/QUIC-path state alive at the application layer.
+    // Handle is saved so the task is aborted immediately when the tunnel
+    // ends, instead of holding the conn Arc alive for one extra interval.
+    let heartbeat_handle = {
+        let conn2 = conn.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+                if conn2.send_datagram(Bytes::from(build_heartbeat())).is_err() {
+                    break;
+                }
+            }
+        })
+    };
+
+    let mut l2q = tokio::spawn(local_udp_to_quic(
+        local.clone(),
+        conn.clone(),
+        assoc_id,
+        pkt_id_ctr,
+        last_peer.clone(),
+    ));
+    let mut q2l = tokio::spawn(quic_to_local_udp(local, conn.clone(), assoc_id, last_peer));
+
+    // Whichever direction ends first (local socket error, or QUIC connection
+    // closing) brings the other one down too, instead of leaving it running
+    // orphaned in the background.
+    tokio::select! {
+        _ = &mut l2q => { q2l.abort(); }
+        _ = &mut q2l => { l2q.abort(); }
+    }
+    heartbeat_handle.abort();
+
+    // Best-effort Dissociate on the way out.
+    let mut s = conn.open_uni().await?;
+    let _ = s.write_all(&build_dissociate(assoc_id)).await;
+    let _ = s.finish();
+
+    info!("[TUIC client] tunnel ended");
+    Ok(())
+}
+
+/// local UDP recv → wrap as Packet → QUIC datagram. Also records the
+/// sender's address into `last_peer` so the reply path knows where to write
+/// QUIC-side responses back to.
+async fn local_udp_to_quic(
+    local: Arc<UdpSocket>,
+    conn: Arc<Connection>,
+    assoc_id: u16,
+    pkt_id_ctr: Arc<AtomicU16>,
+    last_peer: Arc<Mutex<Option<SocketAddr>>>,
 ) {
-    let (mut target_r, mut target_w) = tokio::io::split(target);
+    let mut buf = vec![0u8; 65536];
+    loop {
+        let (n, peer) = match local.recv_from(&mut buf).await {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        *last_peer.lock().await = Some(peer);
+        let id = pkt_id_ctr.fetch_add(1, Ordering::Relaxed);
+        let pkt = build_packet(assoc_id, id, &buf[..n]);
+        if let Err(e) = conn.send_datagram(Bytes::from(pkt)) {
+            warn!("[TUIC client] send_datagram error: {e}");
+        }
+    }
+}
 
-    let write_tx2 = write_tx.clone();
-    let download = async move {
-        let mut buf = vec![0u8; 16 * 1024];
-        loop {
-            match target_r.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let frame = encode_frame(CMD_PSH, stream_id, &buf[..n]);
-                    if write_tx2.send(frame).await.is_err() {
-                        break;
+/// QUIC datagram (Packet replies) → write back to whichever local peer most
+/// recently sent us something, tracked via `last_peer` (shared with
+/// `local_udp_to_quic`). A single local listening port maps to one
+/// assoc_id in this implementation, matching the tunnel's "fixed forwarder"
+/// design — multiple simultaneous distinct local senders are not
+/// distinguished from one another.
+async fn quic_to_local_udp(
+    local: Arc<UdpSocket>,
+    conn: Arc<Connection>,
+    assoc_id: u16,
+    last_peer: Arc<Mutex<Option<SocketAddr>>>,
+) {
+    loop {
+        let dgram = match conn.read_datagram().await {
+            Ok(d) => d,
+            Err(_) => break,
+        };
+        if dgram.is_empty() {
+            continue;
+        }
+        match dgram[0] {
+            TYPE_PACKET => {
+                let Some((recv_assoc, payload)) = parse_packet(&dgram) else {
+                    warn!("[TUIC client] malformed Packet ({} bytes)", dgram.len());
+                    continue;
+                };
+                if recv_assoc != assoc_id {
+                    continue;
+                }
+                let peer = *last_peer.lock().await;
+                if let Some(peer) = peer {
+                    if let Err(e) = local.send_to(payload, peer).await {
+                        warn!("[TUIC client] send_to {peer} error: {e}");
                     }
                 }
             }
-        }
-        let _ = write_tx2.send(encode_frame(CMD_FIN, stream_id, &[])).await;
-    };
-
-    let upload = async move {
-        while let Some(msg) = to_remote_rx.recv().await {
-            match msg {
-                ServerStreamMsg::Data(data) => {
-                    if target_w.write_all(&data).await.is_err() {
-                        break;
-                    }
-                }
-                ServerStreamMsg::Fin => break,
+            TYPE_HEARTBEAT => {
+                debug!("[TUIC client] heartbeat ack");
+            }
+            other => {
+                warn!("[TUIC client] unknown datagram type {other}");
             }
         }
-        let _ = target_w.shutdown().await;
-    };
-
-    tokio::join!(download, upload);
-    streams.lock().await.remove(&stream_id);
+    }
 }
