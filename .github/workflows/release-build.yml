@@ -174,6 +174,7 @@ jobs:
           cp target/${{ matrix.target }}/release/${BIN_NAME} "${PKG_DIR}/"
           [ -f "config.example.yaml" ] && cp config.example.yaml "${PKG_DIR}/" || true
           [ -f "anyst.service" ] && cp anyst.service "${PKG_DIR}/" || true
+          [ -f "anyst.sh" ] && cp anyst.sh "${PKG_DIR}/" || true
           
           PKG_FILE="${BIN_NAME}-${{ matrix.target }}-v${VERSION}.tar.gz"
           cd "${PKG_DIR}"
