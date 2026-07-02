@@ -268,6 +268,21 @@ impl Drop for AnyTlsClient {
                 handle.abort();
             }
         }
+
+        // Drain and close any sessions lingering in the idle pool.
+        // try_lock is used because Drop cannot block; if the lock is
+        // held briefly by `release_session` the OpenSSL/TLS connections
+        // will be torn down by the kernel when the process exits anyway.
+        if let Ok(mut pool) = self.idle_pool.try_lock() {
+            let sessions: Vec<_> = pool.drain(..).map(|(_, s)| s).collect();
+            if !sessions.is_empty() {
+                tokio::spawn(async move {
+                    for s in sessions {
+                        s.close().await;
+                    }
+                });
+            }
+        }
     }
 }
 
@@ -491,14 +506,54 @@ fn spawn_heartbeat(session: Arc<ClientSession>) -> tokio::task::JoinHandle<()> {
 /// to this TLS session passes, so the PaddingScheme's per-packet counter is
 /// meaningful (it counts *calls to this loop*, i.e. calls to the underlying
 /// TLS write, exactly as the spec defines "packet index").
+///
+/// Once `packet_index >= stop` the scheme is never consulted again —
+/// the writer enters a fast path that skips the lock+clone entirely.
+/// The occasional `cmdUpdatePaddingScheme` (which only fires during the
+/// early handshake) invalidates the cached `stop` so the new scheme takes
+/// effect on the very next write.
 async fn client_writer_loop(
     mut tls_write: WriteHalf<TlsClientStream>,
     mut write_rx: mpsc::Receiver<Vec<u8>>,
     scheme: Arc<Mutex<PaddingScheme>>,
 ) {
-    let mut packet_index: u32 = 1; // packet 0 was the auth message, sent before this task started
+    let mut packet_index: u32 = 1; // packet 0 was auth, sent before this task
+    // Cache the stop index so we can skip the lock+clone once padding ends.
+    // `None` means "not cached yet" — the first write always fetches it.
+    let mut cached_stop: Option<u32> = None;
+
     while let Some(data) = write_rx.recv().await {
+        // ── Fast-path check ──────────────────────────────────────────
+        // If we already know padding is over, write the data verbatim
+        // (no Mutex, no clone).  This is the hot path for long‑lived
+        // sessions: only the first ~8 packets go through the padded
+        // branch.
+        let stop = match cached_stop {
+            Some(s) if packet_index >= s => {
+                if tls_write.write_all(&data).await.is_err() {
+                    break;
+                }
+                if tls_write.flush().await.is_err() {
+                    break;
+                }
+                packet_index = packet_index.saturating_add(1);
+                continue;
+            }
+            _ => {
+                // Need the real `stop` — lock once, read the u32, drop.
+                let s = scheme.lock().await.stop;
+                cached_stop = Some(s);
+                s
+            }
+        };
+
+        // ── Padded path (only for packet_index < stop) ───────────────
         let scheme_snapshot = scheme.lock().await.clone();
+        // If the server pushed an updated scheme our cached `stop` may
+        // be stale — refresh it.
+        if scheme_snapshot.stop != stop {
+            cached_stop = Some(scheme_snapshot.stop);
+        }
         let chunks = padding::plan_write(&scheme_snapshot, packet_index, &data);
         let mut ok = true;
         for chunk in chunks {
