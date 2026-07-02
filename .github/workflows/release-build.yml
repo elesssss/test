@@ -17,7 +17,7 @@ on:
 
 permissions:
   contents: write
-  actions: write  # ⚠️ 需要这个权限来触发 workflow
+  actions: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -60,7 +60,6 @@ jobs:
             echo "VERSION=${VER}" >> $GITHUB_OUTPUT
             echo "TAG_NAME=v${VER}" >> $GITHUB_OUTPUT
             echo "IS_TAG_PUSH=false" >> $GITHUB_OUTPUT
-            # main 分支不构建，由 tag 触发的 workflow 来构建
             echo "SHOULD_BUILD=false" >> $GITHUB_OUTPUT
 
           else
@@ -79,14 +78,12 @@ jobs:
 
           TAG="${{ steps.version.outputs.TAG_NAME }}"
 
-          # 检查本地是否存在
           if git rev-parse "${TAG}" >/dev/null 2>&1; then
             echo "Tag ${TAG} already exists locally — skipping."
             echo "TAG_CREATED=false" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # 检查远程是否存在
           if git ls-remote --tags origin "${TAG}" | grep -q "${TAG}"; then
             echo "Tag ${TAG} already exists on remote — skipping."
             echo "TAG_CREATED=false" >> $GITHUB_OUTPUT
@@ -98,17 +95,13 @@ jobs:
           echo "Created and pushed tag: ${TAG}"
           echo "TAG_CREATED=true" >> $GITHUB_OUTPUT
 
-      # ⭐ 关键步骤：用 GitHub CLI 触发 tag 的 workflow
       - name: Trigger tag workflow
         if: steps.create_tag.outputs.TAG_CREATED == 'true'
         run: |
           echo "Tag created successfully! Triggering new workflow run..."
-          
-          # 触发新的 workflow，指定 tag 作为 ref
           gh workflow run release-build.yml \
             --ref "${{ steps.version.outputs.TAG_NAME }}" \
             --field version="${{ steps.version.outputs.VERSION }}"
-          
           echo "Workflow triggered! Check Actions tab for the new run."
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -174,16 +167,21 @@ jobs:
         run: |
           VERSION="${{ needs.prepare.outputs.version }}"
           BIN_NAME="anyst"
-          RELEASE_DIR="v${VERSION}"
-          mkdir -p "${RELEASE_DIR}"
-
-          cp target/${{ matrix.target }}/release/${BIN_NAME} "${RELEASE_DIR}/"
-
-          [ -f "config.example.yaml" ] && cp config.example.yaml "${RELEASE_DIR}/" || true
-          [ -f "anyst.service" ] && cp anyst.service "${RELEASE_DIR}/" || true
-
+          
+          PKG_DIR="anyst-v${VERSION}"
+          mkdir -p "${PKG_DIR}"
+          
+          cp target/${{ matrix.target }}/release/${BIN_NAME} "${PKG_DIR}/"
+          [ -f "config.example.yaml" ] && cp config.example.yaml "${PKG_DIR}/" || true
+          [ -f "anyst.service" ] && cp anyst.service "${PKG_DIR}/" || true
+          
           PKG_FILE="${BIN_NAME}-${{ matrix.target }}-v${VERSION}.tar.gz"
-          tar -czvf "${PKG_FILE}" "${RELEASE_DIR}"
+          cd "${PKG_DIR}"
+          tar -czvf "../${PKG_FILE}" *
+          cd ..
+          
+          rm -rf "${PKG_DIR}"
+          
           echo "PKG_FILE=${PKG_FILE}" >> $GITHUB_ENV
           echo "PKG_PATH=${PKG_FILE}" >> $GITHUB_ENV
 
