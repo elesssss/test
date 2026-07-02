@@ -1,4 +1,5 @@
 mod config;
+mod padding;
 mod tcp;
 mod tls;
 mod udp;
@@ -6,6 +7,7 @@ mod udp;
 use clap::Parser;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::prelude::*;
 
 /// `anyst` — A port tunnel that simultaneously listens on TCP and UDP,
 /// using a shared TLS certificate.
@@ -35,8 +37,9 @@ async fn main() -> anyhow::Result<()> {
     // Load configuration
     let cfg = config::load_config(&cli.config)?;
 
-    // Initialise logging
-    init_logging(&cfg.log_level);
+    // Initialise logging (returns a guard that must be kept alive so
+    // buffered file writes are flushed before the process exits).
+    let _log_guard = init_logging(&cfg.log_level);
 
     info!("anyst starting with {} tunnel(s)", cfg.tunnels.len());
 
@@ -93,13 +96,40 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn init_logging(level: &str) {
+/// Initialise `tracing` subscribers that write to **both** stderr and a
+/// rotating log file (`log_anyst.log` in the current directory).
+///
+/// Returns a `WorkerGuard` that **must** be kept alive for the lifetime of
+/// the process — dropping it causes the non‑blocking file writer to flush
+/// and shut down.
+fn init_logging(level: &str) -> tracing_appender::non_blocking::WorkerGuard {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(format!("anyst={level}")));
 
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
+    // File appender: creates ./log_anyst.log (never rotates — anyst is
+    // long‑lived but a single file is sufficient for its log volume).
+    let file_appender = tracing_appender::rolling::never(".", "log_anyst.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+    // stderr layer (same format as before).
+    let stderr_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
         .with_thread_ids(false)
+        .with_writer(std::io::stderr);
+
+    // File layer — no ANSI escape codes so the file is easily readable
+    // with `tail -f` or a text editor.
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .with_thread_ids(false)
+        .with_ansi(false)
+        .with_writer(non_blocking);
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(stderr_layer)
+        .with(file_layer)
         .init();
+
+    guard
 }
