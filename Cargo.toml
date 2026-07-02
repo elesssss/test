@@ -1,6 +1,6 @@
 [package]
 name = "anyst"
-version = "0.1.1"
+version = "0.0.1"
 edition = "2021"
 description = "A port tunnel with TCP (AnyTLS-like) and UDP (TUIC-like) support using shared TLS certificates"
 
