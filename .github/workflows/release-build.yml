@@ -145,7 +145,7 @@ jobs:
           cp config.example.yaml "${RELEASE_DIR}/"
           cp anyst.service          "${RELEASE_DIR}/"
 
-          PKG_FILE="${RELEASE_DIR}.tar.gz"
+          PKG_FILE="${BIN_NAME}-${{ matrix.target }}-v${VERSION}.tar.gz"
           tar -czvf "${PKG_FILE}" "${RELEASE_DIR}"
           echo "PKG_FILE=${PKG_FILE}" >> $GITHUB_ENV
           echo "PKG_PATH=${PKG_FILE}" >> $GITHUB_ENV
