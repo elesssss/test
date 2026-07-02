@@ -2,14 +2,25 @@ name: Build and Release
 
 on:
   push:
+    # Tag push — e.g. `git tag v0.2.1 && git push origin v0.2.1`
     tags:
-      - 'v*'
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+    # Branch push on main — fires when Cargo.toml is among the changed files
+    # (editing the version via GitHub web UI triggers this).
+    branches:
+      - main
+    paths:
+      - 'Cargo.toml'
+
   workflow_dispatch:
     inputs:
-      tag_name:
-        description: 'Tag name (e.g., v1.0.0)'
+      version:
+        description: 'Version number (e.g. 0.1.0)'
         required: true
-        type: string
+        default: ''
+
+permissions:
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,12 +38,75 @@ jobs:
           - x86_64-unknown-linux-musl
           - aarch64-unknown-linux-musl
 
-    permissions:
-      contents: write
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # needed for `git tag` / `git push --tags`
+
+      # ── Determine version ──────────────────────────────────────────
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Manual trigger.
+            echo "VERSION=${{ inputs.version }}" >> $GITHUB_OUTPUT
+            echo "TAG_NAME=v${{ inputs.version }}" >> $GITHUB_OUTPUT
+            echo "IS_TAG_PUSH=false" >> $GITHUB_OUTPUT
+
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            # Tag trigger.
+            TAG="${{ github.ref_name }}"
+            echo "VERSION=${TAG#v}" >> $GITHUB_OUTPUT
+            echo "TAG_NAME=${TAG}" >> $GITHUB_OUTPUT
+            echo "IS_TAG_PUSH=true" >> $GITHUB_OUTPUT
+
+          else
+            # Cargo.toml push on main — read version from the file.
+            VER=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+            echo "VERSION=${VER}" >> $GITHUB_OUTPUT
+            echo "TAG_NAME=v${VER}" >> $GITHUB_OUTPUT
+            echo "IS_TAG_PUSH=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ── Auto‑create tag (Cargo.toml push only) ─────────────────────
+      # Pushing via the GITHUB_TOKEN does NOT trigger a recursive
+      # workflow run, so there is no infinite‑loop risk.
+      - name: Auto-create release tag
+        if: steps.version.outputs.IS_TAG_PUSH == 'false' && github.event_name != 'workflow_dispatch'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          TAG="${{ steps.version.outputs.TAG_NAME }}"
+
+          # Check if the tag already exists locally …
+          if git rev-parse "${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists locally — skipping creation."
+            exit 0
+          fi
+
+          # … or on the remote (ls-remote fetches without touching local refs).
+          if git ls-remote --tags origin "${TAG}" | grep -q "${TAG}"; then
+            echo "Tag ${TAG} already exists on remote — skipping creation."
+            exit 0
+          fi
+
+          git tag -a "${TAG}" -m "release: ${TAG}"
+          git push origin "${TAG}"
+          echo "Created and pushed tag: ${TAG}"
+
+      # ── Verify version consistency (tag‑trigger only) ──────────────
+      - name: Verify version consistency
+        if: steps.version.outputs.IS_TAG_PUSH == 'true'
+        run: |
+          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          TAG_VERSION="${{ steps.version.outputs.VERSION }}"
+          if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
+            echo "ERROR: Cargo.toml version ($CARGO_VERSION) != tag version ($TAG_VERSION)"
+            exit 1
+          fi
+          echo "Version check passed: $CARGO_VERSION"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -59,37 +133,35 @@ jobs:
 
       - name: Package
         run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
           BIN_NAME="anyst"
-          cd target/${{ matrix.target }}/release
-          tar -czvf ${BIN_NAME}-${{ matrix.target }}.tar.gz ${BIN_NAME}
-          echo "PKG_NAME=${BIN_NAME}-${{ matrix.target }}.tar.gz" >> $GITHUB_ENV
-          echo "PKG_PATH=target/${{ matrix.target }}/release/${BIN_NAME}-${{ matrix.target }}.tar.gz" >> $GITHUB_ENV
+          RELEASE_DIR="${BIN_NAME}"
+          mkdir -p "${RELEASE_DIR}"
 
-      - name: Determine tag name
-        id: tag
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag_name }}" ]; then
-            echo "TAG_NAME=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
-          else
-            echo "TAG_NAME=${{ github.ref_name }}" >> $GITHUB_OUTPUT
-          fi
+          # Binary
+          cp target/${{ matrix.target }}/release/${BIN_NAME} "${RELEASE_DIR}/"
+
+          # Supporting files
+          cp config.example.yaml "${RELEASE_DIR}/"
+          cp anyst.service          "${RELEASE_DIR}/"
+
+          PKG_FILE="${BIN_NAME}-${{ matrix.target }}-v${VERSION}.tar.gz"
+          tar -czvf "${PKG_FILE}" "${RELEASE_DIR}"
+          echo "PKG_FILE=${PKG_FILE}" >> $GITHUB_ENV
+          echo "PKG_PATH=${PKG_FILE}" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: anyst-${{ steps.version.outputs.VERSION }}-${{ matrix.target }}
+          path: ${{ env.PKG_PATH }}
 
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.TAG_NAME }}
+          tag_name: ${{ steps.version.outputs.TAG_NAME }}
           files: ${{ env.PKG_PATH }}
           draft: false
-          prerelease: false
+          prerelease: ${{ contains(steps.version.outputs.VERSION, '-') }}
           generate_release_notes: true
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload to Release (fallback for multiple artifacts)
-        if: matrix.target != 'x86_64-unknown-linux-gnu'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.tag.outputs.TAG_NAME }}
-          files: ${{ env.PKG_PATH }}
-          draft: false
-          prerelease: false
           token: ${{ secrets.GITHUB_TOKEN }}
