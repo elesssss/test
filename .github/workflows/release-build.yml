@@ -2,16 +2,12 @@ name: Build and Release
 
 on:
   push:
-    # Tag push — e.g. `git tag v0.2.1 && git push origin v0.2.1`
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+*'
-    # Branch push on main — fires when Cargo.toml is among the changed files
-    # (editing the version via GitHub web UI triggers this).
     branches:
       - main
     paths:
       - 'Cargo.toml'
-
   workflow_dispatch:
     inputs:
       version:
@@ -21,14 +17,121 @@ on:
 
 permissions:
   contents: write
+  actions: write  # ⚠️ 需要这个权限来触发 workflow
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ── 版本信息准备 job ─────────────────────────────────────────────
+  prepare:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+      tag_name: ${{ steps.version.outputs.TAG_NAME }}
+      is_tag_push: ${{ steps.version.outputs.IS_TAG_PUSH }}
+      should_build: ${{ steps.version.outputs.SHOULD_BUILD }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "VERSION=${{ inputs.version }}" >> $GITHUB_OUTPUT
+            echo "TAG_NAME=v${{ inputs.version }}" >> $GITHUB_OUTPUT
+            echo "IS_TAG_PUSH=false" >> $GITHUB_OUTPUT
+            echo "SHOULD_BUILD=true" >> $GITHUB_OUTPUT
+
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG="${{ github.ref_name }}"
+            echo "VERSION=${TAG#v}" >> $GITHUB_OUTPUT
+            echo "TAG_NAME=${TAG}" >> $GITHUB_OUTPUT
+            echo "IS_TAG_PUSH=true" >> $GITHUB_OUTPUT
+            echo "SHOULD_BUILD=true" >> $GITHUB_OUTPUT
+
+          elif [ "${{ github.ref_name }}" = "main" ]; then
+            VER=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+            echo "VERSION=${VER}" >> $GITHUB_OUTPUT
+            echo "TAG_NAME=v${VER}" >> $GITHUB_OUTPUT
+            echo "IS_TAG_PUSH=false" >> $GITHUB_OUTPUT
+            # main 分支不构建，由 tag 触发的 workflow 来构建
+            echo "SHOULD_BUILD=false" >> $GITHUB_OUTPUT
+
+          else
+            echo "SHOULD_BUILD=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Auto-create release tag (main branch only)
+        id: create_tag
+        if: >
+          github.event_name == 'push' &&
+          github.ref_name == 'main' &&
+          steps.version.outputs.VERSION != ''
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          TAG="${{ steps.version.outputs.TAG_NAME }}"
+
+          # 检查本地是否存在
+          if git rev-parse "${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists locally — skipping."
+            echo "TAG_CREATED=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # 检查远程是否存在
+          if git ls-remote --tags origin "${TAG}" | grep -q "${TAG}"; then
+            echo "Tag ${TAG} already exists on remote — skipping."
+            echo "TAG_CREATED=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          git tag -a "${TAG}" -m "release: ${TAG}"
+          git push origin "${TAG}"
+          echo "Created and pushed tag: ${TAG}"
+          echo "TAG_CREATED=true" >> $GITHUB_OUTPUT
+
+      # ⭐ 关键步骤：用 GitHub CLI 触发 tag 的 workflow
+      - name: Trigger tag workflow
+        if: steps.create_tag.outputs.TAG_CREATED == 'true'
+        run: |
+          echo "Tag created successfully! Triggering new workflow run..."
+          
+          # 触发新的 workflow，指定 tag 作为 ref
+          gh workflow run release-build.yml \
+            --ref "${{ steps.version.outputs.TAG_NAME }}" \
+            --field version="${{ steps.version.outputs.VERSION }}"
+          
+          echo "Workflow triggered! Check Actions tab for the new run."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify Cargo.toml version (tag push only)
+        if: steps.version.outputs.IS_TAG_PUSH == 'true'
+        run: |
+          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          TAG_VERSION="${{ steps.version.outputs.VERSION }}"
+          if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
+            echo "ERROR: Cargo.toml version ($CARGO_VERSION) != tag version ($TAG_VERSION)"
+            exit 1
+          fi
+          echo "Version check passed: $CARGO_VERSION"
+
+  # ── 构建 job ──────────────────────────────────────────────────────
   build:
     name: Build (${{ matrix.target }})
     runs-on: ubuntu-latest
+    needs: prepare
+    if: >
+      needs.prepare.outputs.should_build == 'true' &&
+      (needs.prepare.outputs.is_tag_push == 'true' || github.event_name == 'workflow_dispatch')
     strategy:
       fail-fast: false
       matrix:
@@ -42,71 +145,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0          # needed for `git tag` / `git push --tags`
-
-      # ── Determine version ──────────────────────────────────────────
-      - name: Determine version
-        id: version
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            # Manual trigger.
-            echo "VERSION=${{ inputs.version }}" >> $GITHUB_OUTPUT
-            echo "TAG_NAME=v${{ inputs.version }}" >> $GITHUB_OUTPUT
-            echo "IS_TAG_PUSH=false" >> $GITHUB_OUTPUT
-
-          elif [ "${{ github.ref_type }}" = "tag" ]; then
-            # Tag trigger.
-            TAG="${{ github.ref_name }}"
-            echo "VERSION=${TAG#v}" >> $GITHUB_OUTPUT
-            echo "TAG_NAME=${TAG}" >> $GITHUB_OUTPUT
-            echo "IS_TAG_PUSH=true" >> $GITHUB_OUTPUT
-
-          else
-            # Cargo.toml push on main — read version from the file.
-            VER=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-            echo "VERSION=${VER}" >> $GITHUB_OUTPUT
-            echo "TAG_NAME=v${VER}" >> $GITHUB_OUTPUT
-            echo "IS_TAG_PUSH=false" >> $GITHUB_OUTPUT
-          fi
-
-      # ── Auto‑create tag (Cargo.toml push only) ─────────────────────
-      # Pushing via the GITHUB_TOKEN does NOT trigger a recursive
-      # workflow run, so there is no infinite‑loop risk.
-      - name: Auto-create release tag
-        if: steps.version.outputs.IS_TAG_PUSH == 'false' && github.event_name != 'workflow_dispatch'
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          TAG="${{ steps.version.outputs.TAG_NAME }}"
-
-          # Check if the tag already exists locally …
-          if git rev-parse "${TAG}" >/dev/null 2>&1; then
-            echo "Tag ${TAG} already exists locally — skipping creation."
-            exit 0
-          fi
-
-          # … or on the remote (ls-remote fetches without touching local refs).
-          if git ls-remote --tags origin "${TAG}" | grep -q "${TAG}"; then
-            echo "Tag ${TAG} already exists on remote — skipping creation."
-            exit 0
-          fi
-
-          git tag -a "${TAG}" -m "release: ${TAG}"
-          git push origin "${TAG}"
-          echo "Created and pushed tag: ${TAG}"
-
-      # ── Verify version consistency (tag‑trigger only) ──────────────
-      - name: Verify version consistency
-        if: steps.version.outputs.IS_TAG_PUSH == 'true'
-        run: |
-          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          TAG_VERSION="${{ steps.version.outputs.VERSION }}"
-          if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
-            echo "ERROR: Cargo.toml version ($CARGO_VERSION) != tag version ($TAG_VERSION)"
-            exit 1
-          fi
-          echo "Version check passed: $CARGO_VERSION"
+          fetch-depth: 0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -133,17 +172,15 @@ jobs:
 
       - name: Package
         run: |
-          VERSION="${{ steps.version.outputs.VERSION }}"
+          VERSION="${{ needs.prepare.outputs.version }}"
           BIN_NAME="anyst"
-          RELEASE_DIR="${BIN_NAME}"
+          RELEASE_DIR="v${VERSION}"
           mkdir -p "${RELEASE_DIR}"
 
-          # Binary
           cp target/${{ matrix.target }}/release/${BIN_NAME} "${RELEASE_DIR}/"
 
-          # Supporting files
-          cp config.example.yaml "${RELEASE_DIR}/"
-          cp anyst.service          "${RELEASE_DIR}/"
+          [ -f "config.example.yaml" ] && cp config.example.yaml "${RELEASE_DIR}/" || true
+          [ -f "anyst.service" ] && cp anyst.service "${RELEASE_DIR}/" || true
 
           PKG_FILE="${BIN_NAME}-${{ matrix.target }}-v${VERSION}.tar.gz"
           tar -czvf "${PKG_FILE}" "${RELEASE_DIR}"
@@ -153,15 +190,35 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: anyst-${{ steps.version.outputs.VERSION }}-${{ matrix.target }}
+          name: anyst-${{ needs.prepare.outputs.version }}-${{ matrix.target }}
           path: ${{ env.PKG_PATH }}
 
-      - name: Upload to Release
+  # ── 统一 Release job ──────────────────────────────────────────────
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [prepare, build]
+    if: >
+      needs.prepare.outputs.should_build == 'true' &&
+      (needs.prepare.outputs.is_tag_push == 'true' || github.event_name == 'workflow_dispatch')
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+          merge-multiple: true
+
+      - name: List downloaded artifacts (debug)
+        run: |
+          ls -la ./artifacts
+          echo "Artifacts count: $(ls -1 ./artifacts | wc -l)"
+
+      - name: Create Release and upload assets
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.TAG_NAME }}
-          files: ${{ env.PKG_PATH }}
+          tag_name: ${{ needs.prepare.outputs.TAG_NAME }}
+          files: ./artifacts/*.tar.gz
           draft: false
-          prerelease: ${{ contains(steps.version.outputs.VERSION, '-') }}
+          prerelease: ${{ contains(needs.prepare.outputs.version, '-') }}
           generate_release_notes: true
           token: ${{ secrets.GITHUB_TOKEN }}
