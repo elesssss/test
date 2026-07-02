@@ -4,6 +4,10 @@ on:
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+*'
+    branches:
+      - main
+    paths:
+      - 'Cargo.toml'
   workflow_dispatch:
     inputs:
       version:
@@ -47,12 +51,48 @@ jobs:
             echo "VERSION=${TAG#v}" >> $GITHUB_OUTPUT
             echo "TAG_NAME=${TAG}" >> $GITHUB_OUTPUT
             echo "IS_TAG_PUSH=true" >> $GITHUB_OUTPUT
+            # 如果是从 main 分支自动创建的 tag 触发的，也要构建
             echo "SHOULD_BUILD=true" >> $GITHUB_OUTPUT
 
+          elif [ "${{ github.ref_name }}" = "main" ]; then
+            # push 到 main 分支：读取 Cargo.toml 版本，准备创建 tag
+            VER=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+            echo "VERSION=${VER}" >> $GITHUB_OUTPUT
+            echo "TAG_NAME=v${VER}" >> $GITHUB_OUTPUT
+            echo "IS_TAG_PUSH=false" >> $GITHUB_OUTPUT
+            # 不在这里构建，由 tag 触发的新 workflow 来构建
+            echo "SHOULD_BUILD=false" >> $GITHUB_OUTPUT
+
           else
-            # push 到 main 分支时不自动构建和发布，只做检查
             echo "SHOULD_BUILD=false" >> $GITHUB_OUTPUT
           fi
+
+      - name: Auto-create release tag (main branch only)
+        if: >
+          github.event_name == 'push' &&
+          github.ref_name == 'main' &&
+          steps.version.outputs.VERSION != ''
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          TAG="${{ steps.version.outputs.TAG_NAME }}"
+
+          # 检查本地是否存在
+          if git rev-parse "${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists locally — skipping."
+            exit 0
+          fi
+
+          # 检查远程是否存在
+          if git ls-remote --tags origin "${TAG}" | grep -q "${TAG}"; then
+            echo "Tag ${TAG} already exists on remote — skipping."
+            exit 0
+          fi
+
+          git tag -a "${TAG}" -m "release: ${TAG}"
+          git push origin "${TAG}"
+          echo "Created and pushed tag: ${TAG}"
 
       - name: Verify Cargo.toml version (tag push only)
         if: steps.version.outputs.IS_TAG_PUSH == 'true'
@@ -65,7 +105,7 @@ jobs:
           fi
           echo "Version check passed: $CARGO_VERSION"
 
-  # ── 构建 job，为每个 target 构建二进制 ──────────────────────────
+  # ── 构建 job ──────────────────────────────────────────────────────
   build:
     name: Build (${{ matrix.target }})
     runs-on: ubuntu-latest
@@ -116,14 +156,11 @@ jobs:
           RELEASE_DIR="v${VERSION}"
           mkdir -p "${RELEASE_DIR}"
 
-          # 复制二进制文件
           cp target/${{ matrix.target }}/release/${BIN_NAME} "${RELEASE_DIR}/"
 
-          # 复制配置文件（如果存在）
           [ -f "config.example.yaml" ] && cp config.example.yaml "${RELEASE_DIR}/" || true
           [ -f "anyst.service" ] && cp anyst.service "${RELEASE_DIR}/" || true
 
-          # 压缩包文件名：anyst-x86_64-unknown-linux-gnu-v0.2.1.tar.gz
           PKG_FILE="${BIN_NAME}-${{ matrix.target }}-v${VERSION}.tar.gz"
           tar -czvf "${PKG_FILE}" "${RELEASE_DIR}"
           echo "PKG_FILE=${PKG_FILE}" >> $GITHUB_ENV
