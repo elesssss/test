@@ -343,7 +343,7 @@ Status_anyst(){
 }
 
 View_log(){
-    local log_file="$work_dir/anyst.log"
+    local log_file="$work_dir/log_anyst.log"
     if [ -f "$log_file" ]; then
         echo -e "${Info} 按 ${Red}Ctrl+C${Nc} 退出日志查看"
         tail -f "$log_file"
