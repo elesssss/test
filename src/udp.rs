@@ -733,12 +733,12 @@ async fn dispatch_command(
                         handle.abort();
                     }
                 }
-                debug!("[TUIC server] dissociate {assoc_id}");
+                // dissociate handled
             }
         }
 
         TYPE_HEARTBEAT => {
-            debug!("[TUIC server] heartbeat");
+            // heartbeat — silent (fires every 10 s per connection)
         }
 
         other => {
@@ -1071,7 +1071,7 @@ async fn quic_to_local_udp(
                                 ).await;
                             }
                             TYPE_HEARTBEAT => {
-                                debug!("[TUIC client] heartbeat ack");
+                                // heartbeat ack — silent
                             }
                             other => {
                                 warn!("[TUIC client] unknown datagram type {other}");
@@ -1102,7 +1102,7 @@ async fn quic_to_local_udp(
                                 ).await;
                             }
                             TYPE_HEARTBEAT => {
-                                debug!("[TUIC client] heartbeat ack (stream)");
+                                // heartbeat ack — silent
                             }
                             other => {
                                 warn!("[TUIC client] unknown stream type {other}");
