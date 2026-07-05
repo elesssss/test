@@ -354,7 +354,14 @@ impl AnyTlsClient {
             session.active_streams.fetch_add(1, Ordering::Relaxed);
             // Reused session already had cmdSettings sent; just open a stream.
             let frame = encode_frame(CMD_SYN, stream_id, &[]);
-            session.write_tx.send(frame).await.map_err(|_| anyhow!("session writer gone"))?;
+            if session.write_tx.send(frame).await.is_err() {
+                // Writer is dead — undo the registration so the stream
+                // entry and active count don't leak (this was the root
+                // cause of the "Too many open files" after long uptime).
+                session.streams.lock().await.remove(&stream_id);
+                session.active_streams.fetch_sub(1, Ordering::Relaxed);
+                return Err(anyhow!("session writer gone"));
+            }
             (session, stream_id, rx)
         } else {
             self.dial_new_session().await?
@@ -392,11 +399,13 @@ impl AnyTlsClient {
             .await
             .with_context(|| format!("failed to connect to {}", self.remote))?;
 
+        tracing::info!("[anytls client] connecting TLS to {} (sni={}) ...", self.remote, self.sni);
         let rustls_cfg = tls::build_rustls_client_config(self.insecure);
         let connector = TlsConnector::from(Arc::new(rustls_cfg));
         let server_name = rustls::pki_types::ServerName::try_from(self.sni.clone())
             .map_err(|_| anyhow!("invalid SNI: {}", self.sni))?;
         let mut tls = connector.connect(server_name, tcp).await.context("TLS handshake failed")?;
+        tracing::info!("[anytls client] TLS connected to {} (sni={})", self.remote, self.sni);
 
         // ── Auth: sha256(password) + padding0_len + padding0 ──
         let scheme_snapshot = self.scheme.lock().await.clone();
