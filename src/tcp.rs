@@ -399,13 +399,11 @@ impl AnyTlsClient {
             .await
             .with_context(|| format!("failed to connect to {}", self.remote))?;
 
-        tracing::info!("[anytls client] connecting TLS to {} (sni={}) ...", self.remote, self.sni);
         let rustls_cfg = tls::build_rustls_client_config(self.insecure);
         let connector = TlsConnector::from(Arc::new(rustls_cfg));
         let server_name = rustls::pki_types::ServerName::try_from(self.sni.clone())
             .map_err(|_| anyhow!("invalid SNI: {}", self.sni))?;
         let mut tls = connector.connect(server_name, tcp).await.context("TLS handshake failed")?;
-        tracing::info!("[anytls client] TLS connected to {} (sni={})", self.remote, self.sni);
 
         // ── Auth: sha256(password) + padding0_len + padding0 ──
         let scheme_snapshot = self.scheme.lock().await.clone();
@@ -479,17 +477,17 @@ impl AnyTlsClient {
         let remaining = session.active_streams.load(Ordering::Relaxed);
         if remaining == 0 {
             let mut pool = self.idle_pool.lock().await;
-            // Cap the idle pool to avoid unbounded accumulation during
-            // bursts of short-lived connections between janitor runs.
-            if pool.len() >= 16 {
-                // Collect into a local variable first so the drain iterator is
-                // dropped before we release the lock, avoiding the borrow conflict.
-                let evicted: Option<Arc<ClientSession>> = pool.drain(..1).next().map(|(_, s)| s);
-                if let Some(evicted) = evicted {
-                    drop(pool);
-                    evicted.close().await;
-                    return;
-                }
+            // Cap the idle pool at 64 sessions — high enough for bursty
+            // workloads without excessive FD usage (~128 FDs for TLS +
+            // TCP sockets).
+            if pool.len() >= 64 {
+                // Evict the oldest idle session to make room.
+                let evicted = pool.remove(0).1;
+                drop(pool);
+                evicted.close().await;
+                // Push current session — re‑acquire the lock.
+                self.idle_pool.lock().await.push((Instant::now(), session));
+                return;
             }
             pool.push((Instant::now(), session));
         }
