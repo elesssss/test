@@ -5,6 +5,7 @@ mod tls;
 mod udp;
 
 use clap::Parser;
+use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
@@ -48,23 +49,26 @@ async fn main() -> anyhow::Result<()> {
         let is_server = tunnel.is_server();
         let listen = tunnel.listen.clone();
         let role = if is_server { "server" } else { "client" };
+        let pool = Arc::new(config::RemotePool::new(tunnel.remotes.clone()));
 
         info!(
-            "tunnel[{i}]: mode={role} listen={listen} remote={remote}",
-            remote = tunnel.remote
+            "tunnel[{i}]: mode={role} listen={listen} remotes={:?}",
+            tunnel.remotes
         );
 
         let tcp_cfg = tunnel.clone();
         let udp_cfg = tunnel.clone();
+        let tcp_pool = pool.clone();
+        let udp_pool = pool.clone();
 
         // TCP task (runs forever until shutdown)
         tokio::spawn(async move {
             if tcp_cfg.is_server() {
-                if let Err(e) = tcp::run_tcp_server(&tcp_cfg).await {
+                if let Err(e) = tcp::run_tcp_server(&tcp_cfg, tcp_pool).await {
                     tracing::error!("tunnel[{i}] TCP server died: {e:#}");
                 }
             } else {
-                if let Err(e) = tcp::run_tcp_client(&tcp_cfg).await {
+                if let Err(e) = tcp::run_tcp_client(&tcp_cfg, tcp_pool).await {
                     tracing::error!("tunnel[{i}] TCP client died: {e:#}");
                 }
             }
@@ -73,11 +77,11 @@ async fn main() -> anyhow::Result<()> {
         // UDP task (runs forever until shutdown)
         tokio::spawn(async move {
             if udp_cfg.is_server() {
-                if let Err(e) = udp::run_udp_server(&udp_cfg).await {
+                if let Err(e) = udp::run_udp_server(&udp_cfg, udp_pool).await {
                     tracing::error!("tunnel[{i}] UDP server died: {e:#}");
                 }
             } else {
-                if let Err(e) = udp::run_udp_client(&udp_cfg).await {
+                if let Err(e) = udp::run_udp_client(&udp_cfg, udp_pool).await {
                     tracing::error!("tunnel[{i}] UDP client died: {e:#}");
                 }
             }

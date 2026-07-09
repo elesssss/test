@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
@@ -17,8 +18,10 @@ pub struct TunnelConfig {
     /// Local listen address, e.g. "[::]:1017" or "0.0.0.0:1017"
     pub listen: String,
 
-    /// Remote address as "host:port", resolved at connection time
-    pub remote: String,
+    /// Remote addresses as "host:port".  When more than one is listed
+    /// connections are distributed across them with round‑robin.
+    #[serde(default)]
+    pub remotes: Vec<String>,
 
     /// TLS Server Name Indication (SNI) for TLS/QUIC
     pub sni: String,
@@ -53,6 +56,34 @@ impl TunnelConfig {
     }
 }
 
+/// Thread‑safe round‑robin remote address selector.
+#[derive(Debug)]
+pub struct RemotePool {
+    remotes: Vec<String>,
+    next: AtomicUsize,
+}
+
+impl RemotePool {
+    pub fn new(remotes: Vec<String>) -> Self {
+        assert!(!remotes.is_empty(), "at least one remote required");
+        Self { remotes, next: AtomicUsize::new(0) }
+    }
+
+    /// Pick the next remote in round‑robin order.
+    #[inline]
+    pub fn pick(&self) -> &str {
+        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.remotes.len();
+        &self.remotes[idx]
+    }
+
+    /// Return the first remote (useful for one‑time connections like QUIC
+    /// client init where the pool lives across reconnects).
+    #[inline]
+    pub fn first(&self) -> &str {
+        &self.remotes[0]
+    }
+}
+
 /// Load and parse the YAML config file.
 pub fn load_config(path: &str) -> anyhow::Result<Config> {
     let content = std::fs::read_to_string(path)
@@ -62,6 +93,9 @@ pub fn load_config(path: &str) -> anyhow::Result<Config> {
 
     // Validate tunnel entries
     for (i, t) in config.tunnels.iter().enumerate() {
+        if t.remotes.is_empty() {
+            anyhow::bail!("tunnel[{}]: at least one remote address required", i);
+        }
         if t.is_server() {
             // Server mode: cert and key files must exist
             let cert_path = t.cert.as_ref().unwrap();
