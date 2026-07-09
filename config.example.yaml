@@ -14,6 +14,7 @@ tunnels:         # 支持多组转发
     remotes:                   # 目标服务器列表（round‑robin 负载均衡）
       - "your-target1.com:1019"
       - "your-target2.com:1019"
+      - "your-target3.com:1019"
     sni: "bing.com"     # TLS 伪装域名
     password: "your-password-here"     # 必须与入站密码匹配
     cert: "/path/to/server.crt"     # 证书路径（自签 or Let's Encrypt）
