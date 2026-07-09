@@ -443,7 +443,8 @@ YAMLHEADER
 
         cat >>"$config_path" <<TUNNEL
   - listen: "${listen}"
-    remote: "${remote}"
+    remotes:
+      - "${remote}"
     sni: "bing.com"
     password: "8f0ea803433fbc6a8fa0689313d9d8e3"
 TUNNEL
