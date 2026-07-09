@@ -612,20 +612,15 @@ async fn dispatch_command(
                     // Pick a target for this assoc (round‑robin).
                     let target_addr = pool.pick().to_string();
                     let assoc = Arc::new(ServerAssoc::new(sock.clone(), target_addr, from_mode));
-                    map.insert(assoc_id, assoc.clone());
 
-                    // Spawn the reply pump.  This task lives as long as the
-                    // assoc; it reads replies from `sock` and relays them
-                    // back to the client in the same transport mode the
-                    // client used.  The JoinHandle is stored so the task can
-                    // be aborted on Dissociate (matching upstream TUIC).
+                    // Spawn the reply pump and store its handle BEFORE
+                    // inserting the assoc into the shared map, so a
+                    // concurrent Dissociate always sees a valid handle.
                     let conn2 = conn.clone();
                     let pkt_id_ctr2 = pkt_id_ctr.clone();
                     let assocs2 = assocs.clone();
                     let assoc_for_pump = assoc.clone();
                     let reply_handle = tokio::spawn(async move {
-                        // Snapshot the datagram limit once — it is
-                        // stable after the QUIC handshake settles.
                         let max_payload = datagram_payload_limit(&conn2);
                         let mut buf = vec![0u8; 65536];
                         loop {
@@ -659,6 +654,9 @@ async fn dispatch_command(
                         assocs2.lock().await.remove(&assoc_id);
                     });
                     *assoc.reply_handle.lock().await = Some(reply_handle);
+
+                    // Only now insert — the assoc is fully initialised.
+                    map.insert(assoc_id, assoc.clone());
 
                     assoc
                 }
@@ -826,14 +824,20 @@ pub async fn run_udp_client(config: &TunnelConfig, pool: Arc<RemotePool>) -> any
         .ok_or_else(|| anyhow::anyhow!("no address found for {}", remote))?;
 
     info!("[TUIC client] connecting QUIC to {remote_addr} (sni={sni}) ...");
-    let conn = tokio::time::timeout(Duration::from_secs(10), async {
+    let conn = match tokio::time::timeout(Duration::from_secs(10), async {
         endpoint
             .connect(remote_addr, &sni)?
             .await
             .map_err(anyhow::Error::from)
     })
     .await
-    .context("QUIC connect timed out")??;
+    {
+        Ok(Ok(c)) => c,
+        Err(_) | Ok(Err(_)) => {
+            pool.mark_failed(&remote);
+            anyhow::bail!("QUIC connect to {} timed out", remote);
+        }
+    };
     info!("[TUIC client] QUIC connected to {remote_addr}");
 
     // ── Authenticate (unidirectional, sent and forgotten — 0‑RTT) ──────
