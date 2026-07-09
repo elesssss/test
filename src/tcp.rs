@@ -218,6 +218,10 @@ struct ClientSession {
     /// the task does not hold an Arc<ClientSession> clone alive for up to
     /// one extra HEARTBEAT_INTERVAL after the session has already ended.
     heartbeat_handle: Mutex<Option<JoinHandle<()>>>,
+    /// The remote address this session connects to.  Used by the idle
+    /// pool to prefer sessions that match the current round‑robin pick,
+    /// so load balancing isn't defeated by session reuse.
+    target_remote: String,
 }
 
 enum StreamEvent {
@@ -338,32 +342,39 @@ impl AnyTlsClient {
         Ok(())
     }
 
-    /// Reuse the most-recently-idled session if one is available, else dial
-    /// a brand-new TLS session (sending `cmdSettings` + the first `cmdSYN`
-    /// batched into a single write, matching the spec's "packet 1").
+    /// Reuse the most-recently-idled session that matches the current
+    /// round‑robin remote pick, or dial a new one.  This prevents session
+    /// reuse from defeating load balancing — if the pool only has sessions
+    /// for `vps1` but the next pick is `vps2`, a new TLS connection is
+    /// created to `vps2` instead of reusing the `vps1` one.
     async fn open_stream(
         self: &Arc<Self>,
     ) -> Result<(Arc<ClientSession>, u32, mpsc::Receiver<StreamEvent>)> {
-        let reused = self.idle_pool.lock().await.pop().map(|(_, s)| s);
+        let picked = self.remote_pool.pick().to_string();
+
+        // Search the idle pool for a session that already connects to the
+        // picked remote (prefer newest → pop from back).
+        let reused = {
+            let mut pool = self.idle_pool.lock().await;
+            pool.iter()
+                .rposition(|(_, s)| s.target_remote == picked)
+                .map(|idx| pool.remove(idx).1)
+        };
 
         let (session, stream_id, rx) = if let Some(session) = reused {
             let stream_id = session.next_stream_id.fetch_add(1, Ordering::Relaxed);
             let (tx, rx) = mpsc::channel(256);
             session.streams.lock().await.insert(stream_id, tx);
             session.active_streams.fetch_add(1, Ordering::Relaxed);
-            // Reused session already had cmdSettings sent; just open a stream.
             let frame = encode_frame(CMD_SYN, stream_id, &[]);
             if session.write_tx.send(frame).await.is_err() {
-                // Writer is dead — undo the registration so the stream
-                // entry and active count don't leak (this was the root
-                // cause of the "Too many open files" after long uptime).
                 session.streams.lock().await.remove(&stream_id);
                 session.active_streams.fetch_sub(1, Ordering::Relaxed);
                 return Err(anyhow!("session writer gone"));
             }
             (session, stream_id, rx)
         } else {
-            self.dial_new_session().await?
+            self.dial_new_session_to(picked).await?
         };
 
         // Wait for cmdSYNACK before handing the stream back to the caller.
@@ -391,19 +402,29 @@ impl AnyTlsClient {
         }
     }
 
-    async fn dial_new_session(
+    async fn dial_new_session_to(
         self: &Arc<Self>,
+        remote: String,
     ) -> Result<(Arc<ClientSession>, u32, mpsc::Receiver<StreamEvent>)> {
-        let remote = self.remote_pool.pick().to_string();
-        let tcp = TcpStream::connect(&remote)
-            .await
-            .with_context(|| format!("failed to connect to {}", remote))?;
+        let tcp = match TcpStream::connect(&remote).await {
+            Ok(t) => t,
+            Err(e) => {
+                self.remote_pool.mark_failed(&remote);
+                return Err(anyhow!("failed to connect to {}: {}", remote, e));
+            }
+        };
 
         let rustls_cfg = tls::build_rustls_client_config(self.insecure);
         let connector = TlsConnector::from(Arc::new(rustls_cfg));
         let server_name = rustls::pki_types::ServerName::try_from(self.sni.clone())
             .map_err(|_| anyhow!("invalid SNI: {}", self.sni))?;
-        let mut tls = connector.connect(server_name, tcp).await.context("TLS handshake failed")?;
+        let mut tls = match connector.connect(server_name, tcp).await {
+            Ok(t) => t,
+            Err(e) => {
+                self.remote_pool.mark_failed(&remote);
+                return Err(anyhow!("TLS handshake failed to {}: {}", remote, e));
+            }
+        };
 
         // ── Auth: sha256(password) + padding0_len + padding0 ──
         let scheme_snapshot = self.scheme.lock().await.clone();
@@ -434,6 +455,7 @@ impl AnyTlsClient {
             reader_handle: Mutex::new(None),
             writer_handle: Mutex::new(None),
             heartbeat_handle: Mutex::new(None),
+            target_remote: remote.clone(),
         });
 
         let writer_handle = tokio::spawn(client_writer_loop(tls_write, write_rx, self.scheme.clone()));
@@ -785,6 +807,7 @@ async fn serve_session(tls: TlsServerStream, expected_auth: [u8; 32], pool: Arc<
                         ));
                     }
                     Err(e) => {
+                        pool.mark_failed(&target_addr);
                         let msg = format!("failed to connect to target: {e}");
                         let _ = write_tx2.send(encode_frame(CMD_SYNACK, stream_id, msg.as_bytes())).await;
                     }
