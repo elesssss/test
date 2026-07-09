@@ -39,7 +39,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-use crate::config::TunnelConfig;
+use crate::config::{RemotePool, TunnelConfig};
 use crate::padding::{self, PaddingScheme};
 use crate::tls;
 
@@ -99,8 +99,8 @@ fn sha256_password(password: &str) -> [u8; 32] {
 
 // ── Entry point ─────────────────────────────────────────────────────────────
 
-pub async fn run_tcp_client(cfg: &TunnelConfig) -> Result<()> {
-    let client = Arc::new(AnyTlsClient::new(cfg)?);
+pub async fn run_tcp_client(cfg: &TunnelConfig, pool: Arc<RemotePool>) -> Result<()> {
+    let client = Arc::new(AnyTlsClient::new(cfg, pool)?);
     client.clone().spawn_idle_janitor();
 
     let listener = TcpListener::bind(&cfg.listen)
@@ -143,7 +143,7 @@ pub async fn run_tcp_client(cfg: &TunnelConfig) -> Result<()> {
     Ok(())
 }
 
-pub async fn run_tcp_server(cfg: &TunnelConfig) -> Result<()> {
+pub async fn run_tcp_server(cfg: &TunnelConfig, pool: Arc<RemotePool>) -> Result<()> {
     let cert = cfg.cert.as_ref().ok_or_else(|| anyhow!("server mode requires `cert`"))?;
     let key = cfg.key.as_ref().ok_or_else(|| anyhow!("server mode requires `key`"))?;
 
@@ -156,7 +156,6 @@ pub async fn run_tcp_server(cfg: &TunnelConfig) -> Result<()> {
     tracing::info!("[anytls server] listening on {}", cfg.listen);
 
     let expected_auth = sha256_password(&cfg.password);
-    let remote = Arc::new(cfg.remote.clone());
 
     // JoinSet tracks all per‑session tasks so they can be aborted when the
     // listener exits (matching sing‑box: closing the listener cascades to
@@ -174,7 +173,7 @@ pub async fn run_tcp_server(cfg: &TunnelConfig) -> Result<()> {
                     }
                 };
                 let acceptor = acceptor.clone();
-                let remote = remote.clone();
+                let pool = pool.clone();
 
                 tasks.spawn(async move {
                     let tls = match acceptor.accept(stream).await {
@@ -184,7 +183,7 @@ pub async fn run_tcp_server(cfg: &TunnelConfig) -> Result<()> {
                             return;
                         }
                     };
-                    if let Err(e) = serve_session(tls, expected_auth, remote).await {
+                    if let Err(e) = serve_session(tls, expected_auth, pool).await {
                         tracing::debug!("[anytls server] session with {peer} ended: {e:#}");
                     }
                 });
@@ -245,7 +244,7 @@ impl ClientSession {
 }
 
 struct AnyTlsClient {
-    remote: String,
+    remote_pool: Arc<RemotePool>,
     sni: String,
     password: String,
     insecure: bool,
@@ -287,11 +286,11 @@ impl Drop for AnyTlsClient {
 }
 
 impl AnyTlsClient {
-    fn new(cfg: &TunnelConfig) -> Result<Self> {
+    fn new(cfg: &TunnelConfig, pool: Arc<RemotePool>) -> Result<Self> {
         Ok(Self {
-            remote: cfg.remote.clone(),
+            remote_pool: pool.clone(),
             sni: if cfg.sni.is_empty() {
-                cfg.remote.rsplit_once(':').map(|(h, _)| h.to_string()).unwrap_or_default()
+                pool.first().rsplit_once(':').map(|(h, _)| h.to_string()).unwrap_or_default()
             } else {
                 cfg.sni.clone()
             },
@@ -395,9 +394,10 @@ impl AnyTlsClient {
     async fn dial_new_session(
         self: &Arc<Self>,
     ) -> Result<(Arc<ClientSession>, u32, mpsc::Receiver<StreamEvent>)> {
-        let tcp = TcpStream::connect(&self.remote)
+        let remote = self.remote_pool.pick().to_string();
+        let tcp = TcpStream::connect(&remote)
             .await
-            .with_context(|| format!("failed to connect to {}", self.remote))?;
+            .with_context(|| format!("failed to connect to {}", remote))?;
 
         let rustls_cfg = tls::build_rustls_client_config(self.insecure);
         let connector = TlsConnector::from(Arc::new(rustls_cfg));
@@ -725,7 +725,7 @@ enum ServerStreamMsg {
 
 /// One accepted TLS connection on the server side: validates auth, then
 /// dispatches session frames until the connection closes.
-async fn serve_session(tls: TlsServerStream, expected_auth: [u8; 32], remote: Arc<String>) -> Result<()> {
+async fn serve_session(tls: TlsServerStream, expected_auth: [u8; 32], pool: Arc<RemotePool>) -> Result<()> {
     let (mut tls_read, tls_write) = tokio::io::split(tls);
 
     // ── Auth ──
@@ -767,11 +767,11 @@ async fn serve_session(tls: TlsServerStream, expected_auth: [u8; 32], remote: Ar
                     )).await;
                     break;
                 }
-                let remote = remote.clone();
+                let target_addr = pool.pick().to_string();
                 let write_tx2 = write_tx.clone();
                 let streams2 = streams.clone();
 
-                match TcpStream::connect(remote.as_str()).await {
+                match TcpStream::connect(target_addr.as_str()).await {
                     Ok(target) => {
                         let (to_remote_tx, to_remote_rx) = mpsc::channel(64);
                         streams2.lock().await.insert(stream_id, ServerStream { to_remote_tx });
