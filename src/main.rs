@@ -49,15 +49,30 @@ async fn main() -> anyhow::Result<()> {
         let listen = tunnel.listen.clone();
         let role = if is_server { "server" } else { "client" };
 
-        info!(
-            "tunnel[{i}]: mode={role} listen={listen} remotes=[{remotes}]",
-            remotes = tunnel
-                .remotes
-                .iter()
-                .map(|r| r.addr.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+        // Resolve the remote list once so we can log it (and later
+        // tunnel functions use the config directly).
+        let remotes = match tunnel.remotes_list() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("tunnel[{i}]: {e:#}");
+                continue;
+            }
+        };
+
+        if is_server {
+            info!(
+                "tunnel[{i}]: mode={role} listen={listen} remotes={remotes}",
+                remotes = remotes.iter()
+                    .map(|r| format!("{}@{}", r.password, r.addr))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        } else {
+            let remote = &remotes.first().map(|r| r.addr.as_str()).unwrap_or("?");
+            info!(
+                "tunnel[{i}]: mode={role} listen={listen} remote={remote}",
+            );
+        }
 
         let tcp_cfg = tunnel.clone();
         let udp_cfg = tunnel.clone();
