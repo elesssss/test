@@ -1,21 +1,39 @@
-log_level: "info"   # info / warn / error
+log_level: "info"   # info / warn / error / debug
 
 tunnels:         # 支持多组转发
-  - listen: "[::]:1017"        # 监听地址，支持 TCP & UDP
-    remotes:                   # 境外出口服务器地址列表（round‑robin 负载均衡）
-      - "your-vps1.com:1018"
-      - "your-vps2.com:1018"
-      - "your-vps3.com:1018"
-    sni: "bing.com"     # TLS 伪装域名
-    insecure: true     # 自签证书请保留本行；Let's Encrypt 请注释
-    password: "your-password-here"     # 必须与出站密码匹配
+  # ── 隧道入口 1：连到隧道出口，用密码 "password-for-target1" → 隧道出口路由到 target1 ──
+  - listen: "[::]:1017"
+    remotes:                   # 出口服务器地址列表（每个条目有独立密码，对应不同目标地址）
+      - addr: "your-vps.com:1018"       # 隧道出口地址
+        password: "password-for-target1" # 与隧道出口某个目标地址的密码匹配（决定转发目标）
+    sni: "bing.com"            # TLS 伪装域名
+    insecure: true             # 自签证书请保留；Let's Encrypt 请注释
 
-  - listen: "[::]:1018"         # 监听地址，接受境内入口连接
-    remotes:                   # 目标服务器列表（round‑robin 负载均衡）
-      - "your-target1.com:1019"
-      - "your-target2.com:1019"
-      - "your-target3.com:1019"
-    sni: "bing.com"     # TLS 伪装域名
-    password: "your-password-here"     # 必须与入站密码匹配
-    cert: "/path/to/server.crt"     # 证书路径（自签 or Let's Encrypt）
-    key:  "/path/to/server.key"     # 私钥路径（自签 or Let's Encrypt）
+  # ── 隧道入口 2：同隧道出口、不同密码 → 路由到 target2 ──
+  - listen: "[::]:2018"
+    remotes:
+      - addr: "your-vps.com:1018"
+        password: "password-for-target2"
+    sni: "bing.com"
+    insecure: true
+
+  # ── 隧道入口 3：同隧道出口、不同密码 → 路由到 target3 ──
+  - listen: "[::]:2019"
+    remotes:
+      - addr: "your-vps.com:1018"
+        password: "password-for-target3"
+    sni: "bing.com"
+    insecure: true
+
+  # ── 隧道出口：端口复用，根据隧道入口密码匹配不同目标地址 ──
+  - listen: "[::]:1018"
+    remotes:                   # 目标地址列表（密码匹配 → 路由到对应 addr）
+      - addr: "your-target1.com:1019"   # 目标地址 1
+        password: "password-for-target1"
+      - addr: "your-target2.com:1019"   # 目标地址 2
+        password: "password-for-target2"
+      - addr: "your-target3.com:1019"   # 目标地址 3
+        password: "password-for-target3"
+    sni: "bing.com"            # TLS 伪装域名
+    cert: "/path/to/server.crt" # 证书路径（自签 or Let's Encrypt）
+    key:  "/path/to/server.key" # 私钥路径（自签 or Let's Encrypt）
