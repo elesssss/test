@@ -8,5 +8,5 @@ bash <(curl -sSL https://raw.githubusercontent.com/bryet/anyst/main/anyst.sh)
 
 ## ✨一键脚本(国内机)
 ```
-bash <(curl -sSL https://gh-proxy.org/raw.githubusercontent.com/bryet/anyst/main/anyst.sh) v0.1.0
+bash <(curl -sSL https://gh-proxy.org/raw.githubusercontent.com/bryet/anyst/main/anyst.sh) v0.1.2
 ```
