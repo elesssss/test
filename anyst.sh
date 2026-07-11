@@ -444,9 +444,9 @@ YAMLHEADER
         cat >>"$config_path" <<TUNNEL
   - listen: "${listen}"
     remotes:
-      - "${remote}"
+      - addr: "${remote}"
+        password: "8f0ea803433fbc6a8fa0689313d9d8e3"
     sni: "bing.com"
-    password: "8f0ea803433fbc6a8fa0689313d9d8e3"
 TUNNEL
 
         if [ "$mode" == "client" ]; then

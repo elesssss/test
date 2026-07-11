@@ -53,7 +53,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-use crate::config::{RemotePool, TunnelConfig};
+use crate::config::TunnelConfig;
 use crate::tls;
 
 // ── TUIC v5 command types ───────────────────────────────────────────────────
@@ -322,7 +322,7 @@ async fn send_packet_reply(
 
 // ── Server ──────────────────────────────────────────────────────────────────
 
-pub async fn run_udp_server(config: &TunnelConfig, pool: Arc<RemotePool>) -> anyhow::Result<()> {
+pub async fn run_udp_server(config: &TunnelConfig) -> anyhow::Result<()> {
     let cert = config.cert.as_ref().context("server mode requires `cert`")?;
     let key = config.key.as_ref().context("server mode requires `key`")?;
 
@@ -335,8 +335,16 @@ pub async fn run_udp_server(config: &TunnelConfig, pool: Arc<RemotePool>) -> any
 
     info!("[TUIC server] listening on {listen_addr} (QUIC)");
 
-    let expected_uuid = derive_uuid(&config.password);
-    let password = Arc::new(config.password.clone());
+    let remotes = config.remotes_vec()?;
+    // Build uuid → (password, remote_addr) lookup map for port multiplexing:
+    // the UUID the client sends (derived from its password) determines which
+    // backend to forward to.
+    let remote_map: Arc<HashMap<[u8; 16], (String, String)>> = Arc::new(
+        remotes
+            .iter()
+            .map(|r| (derive_uuid(&r.password), (r.password.clone(), r.addr.clone())))
+            .collect(),
+    );
 
     // JoinSet tracks per‑connection tasks so they can be aborted when the
     // endpoint exits (sing‑box pattern: closing the server cascades to
@@ -350,15 +358,14 @@ pub async fn run_udp_server(config: &TunnelConfig, pool: Arc<RemotePool>) -> any
                     Some(inc) => inc,
                     None => break,
                 };
-                let password = password.clone();
-                let pool = pool.clone();
+                let remote_map = remote_map.clone();
                 let peer = incoming.remote_address();
 
                 tasks.spawn(async move {
                     match incoming.await {
                         Ok(conn) => {
                             if let Err(e) =
-                                handle_tuic_connection(conn, expected_uuid, password, pool).await
+                                handle_tuic_connection(conn, remote_map).await
                             {
                                 error!("[TUIC server] connection from {peer}: {e:#}");
                             }
@@ -396,7 +403,6 @@ struct AssocState {
 
 struct ServerAssoc {
     sock: Arc<UdpSocket>,
-    target_addr: String,
     state: Mutex<AssocState>,
     /// Fragmented‑packet reassembly buffers, keyed by `pkt_id`.
     reassembly: Mutex<HashMap<u16, ReassemblyBuffer>>,
@@ -407,10 +413,9 @@ struct ServerAssoc {
 }
 
 impl ServerAssoc {
-    fn new(sock: Arc<UdpSocket>, target_addr: String, mode: RelayMode) -> Self {
+    fn new(sock: Arc<UdpSocket>, mode: RelayMode) -> Self {
         Self {
             sock,
-            target_addr,
             state: Mutex::new(AssocState {
                 mode,
                 last_seen: Instant::now(),
@@ -425,9 +430,7 @@ impl ServerAssoc {
 
 async fn handle_tuic_connection(
     conn: Connection,
-    expected_uuid: [u8; 16],
-    password: Arc<String>,
-    pool: Arc<RemotePool>,
+    remote_map: Arc<HashMap<[u8; 16], (String, String)>>,
 ) -> anyhow::Result<()> {
     let peer = conn.remote_address();
     info!("[TUIC server] new QUIC connection from {peer}");
@@ -488,6 +491,20 @@ async fn handle_tuic_connection(
     let recv_uuid: [u8; 16] = auth_data[2..18].try_into().unwrap();
     let recv_token: [u8; 32] = auth_data[18..50].try_into().unwrap();
 
+    // Look up which password → backend mapping this UUID belongs to.
+    // This is the port-multiplexing core: the client's password (encoded as
+    // its UUID) determines which target address to forward to.
+    let (password, remote_addr) = match remote_map.get(&recv_uuid) {
+        Some((pwd, addr)) => (pwd.clone(), addr.clone()),
+        None => {
+            let _ = conn.close(
+                VarInt::from_u32(ERROR_AUTHENTICATION_FAILED),
+                b"authentication failed",
+            );
+            anyhow::bail!("auth failed from {peer}: unknown UUID");
+        }
+    };
+
     let expected_token = derive_token(&conn, &recv_uuid, &password).map_err(|e| {
         let _ = conn.close(
             VarInt::from_u32(ERROR_AUTHENTICATION_FAILED),
@@ -496,13 +513,15 @@ async fn handle_tuic_connection(
         e
     })?;
 
-    if recv_uuid != expected_uuid || recv_token != expected_token {
+    if recv_token != expected_token {
         let _ = conn.close(
             VarInt::from_u32(ERROR_AUTHENTICATION_FAILED),
             b"authentication failed",
         );
-        anyhow::bail!("auth failed from {peer}");
+        anyhow::bail!("auth failed from {peer}: token mismatch");
     }
+
+    let remote = Arc::new(remote_addr);
     info!("[TUIC server] auth ok from {peer}");
 
     let assocs: Arc<Mutex<HashMap<u16, Arc<ServerAssoc>>>> =
@@ -543,8 +562,8 @@ async fn handle_tuic_connection(
     // Run datagram and stream receivers concurrently — whichever channel the
     // client chooses for a Packet, the server handles it.  When either loop
     // exits (connection closed) the other is cancelled.
-    let dgram_loop = run_datagram_loop(&conn, assocs.clone(), pool.clone(), &pkt_id_ctr);
-    let stream_loop = run_stream_loop(&conn, assocs.clone(), pool.clone(), &pkt_id_ctr);
+    let dgram_loop = run_datagram_loop(&conn, assocs.clone(), remote.clone(), &pkt_id_ctr);
+    let stream_loop = run_stream_loop(&conn, assocs.clone(), remote.clone(), &pkt_id_ctr);
 
     tokio::select! {
         r = dgram_loop => {
@@ -576,7 +595,7 @@ async fn dispatch_command(
     cmd_data: &[u8],
     from_mode: RelayMode,
     assocs: &Arc<Mutex<HashMap<u16, Arc<ServerAssoc>>>>,
-    pool: &Arc<RemotePool>,
+    remote: &str,
     conn: &Connection,
     pkt_id_ctr: &Arc<AtomicU16>,
 ) {
@@ -609,18 +628,21 @@ async fn dispatch_command(
                             return;
                         }
                     };
-                    // Pick a target for this assoc (round‑robin).
-                    let target_addr = pool.pick().to_string();
-                    let assoc = Arc::new(ServerAssoc::new(sock.clone(), target_addr, from_mode));
+                    let assoc = Arc::new(ServerAssoc::new(sock.clone(), from_mode));
+                    map.insert(assoc_id, assoc.clone());
 
-                    // Spawn the reply pump and store its handle BEFORE
-                    // inserting the assoc into the shared map, so a
-                    // concurrent Dissociate always sees a valid handle.
+                    // Spawn the reply pump.  This task lives as long as the
+                    // assoc; it reads replies from `sock` and relays them
+                    // back to the client in the same transport mode the
+                    // client used.  The JoinHandle is stored so the task can
+                    // be aborted on Dissociate (matching upstream TUIC).
                     let conn2 = conn.clone();
                     let pkt_id_ctr2 = pkt_id_ctr.clone();
                     let assocs2 = assocs.clone();
                     let assoc_for_pump = assoc.clone();
                     let reply_handle = tokio::spawn(async move {
+                        // Snapshot the datagram limit once — it is
+                        // stable after the QUIC handshake settles.
                         let max_payload = datagram_payload_limit(&conn2);
                         let mut buf = vec![0u8; 65536];
                         loop {
@@ -655,9 +677,6 @@ async fn dispatch_command(
                     });
                     *assoc.reply_handle.lock().await = Some(reply_handle);
 
-                    // Only now insert — the assoc is fully initialised.
-                    map.insert(assoc_id, assoc.clone());
-
                     assoc
                 }
             };
@@ -672,7 +691,7 @@ async fn dispatch_command(
             // ── Reassembly ────────────────────────────────────────────
             if frag_total == 1 {
                 // Fast path: single fragment, forward immediately.
-                if let Err(e) = assoc.sock.send_to(payload, &assoc.target_addr).await {
+                if let Err(e) = assoc.sock.send_to(payload, remote).await {
                     warn!("[TUIC server] assoc {assoc_id} send to remote failed: {e}");
                 }
             } else {
@@ -716,7 +735,7 @@ async fn dispatch_command(
                         .unwrap()
                         .assemble();
                     drop(reassembly);
-                    if let Err(e) = assoc.sock.send_to(&complete, &assoc.target_addr).await {
+                    if let Err(e) = assoc.sock.send_to(&complete, remote).await {
                         warn!("[TUIC server] assoc {assoc_id} send to remote failed: {e}");
                     }
                 }
@@ -753,7 +772,7 @@ async fn dispatch_command(
 async fn run_datagram_loop(
     conn: &Connection,
     assocs: Arc<Mutex<HashMap<u16, Arc<ServerAssoc>>>>,
-    pool: Arc<RemotePool>,
+    remote: Arc<String>,
     pkt_id_ctr: &Arc<AtomicU16>,
 ) -> anyhow::Result<()> {
     loop {
@@ -761,7 +780,7 @@ async fn run_datagram_loop(
             Ok(d) => d,
             Err(e) => return Err(anyhow::anyhow!("read_datagram: {e}")),
         };
-        dispatch_command(&dgram, RelayMode::Datagram, &assocs, &pool, conn, pkt_id_ctr)
+        dispatch_command(&dgram, RelayMode::Datagram, &assocs, &remote, conn, pkt_id_ctr)
             .await;
     }
 }
@@ -771,7 +790,7 @@ async fn run_datagram_loop(
 async fn run_stream_loop(
     conn: &Connection,
     assocs: Arc<Mutex<HashMap<u16, Arc<ServerAssoc>>>>,
-    pool: Arc<RemotePool>,
+    remote: Arc<String>,
     pkt_id_ctr: &Arc<AtomicU16>,
 ) -> anyhow::Result<()> {
     loop {
@@ -789,14 +808,14 @@ async fn run_stream_loop(
                 continue;
             }
         };
-        dispatch_command(&data, RelayMode::Stream, &assocs, &pool, conn, pkt_id_ctr)
+        dispatch_command(&data, RelayMode::Stream, &assocs, &remote, conn, pkt_id_ctr)
             .await;
     }
 }
 
 // ── Client ──────────────────────────────────────────────────────────────────
 
-pub async fn run_udp_client(config: &TunnelConfig, pool: Arc<RemotePool>) -> anyhow::Result<()> {
+pub async fn run_udp_client(config: &TunnelConfig) -> anyhow::Result<()> {
     let local = Arc::new(
         UdpSocket::bind(&config.listen)
             .await
@@ -804,45 +823,44 @@ pub async fn run_udp_client(config: &TunnelConfig, pool: Arc<RemotePool>) -> any
     );
     info!("[TUIC client] listening on {} (plain UDP)", config.listen);
 
+    let remote_host = config.default_remote()?;
+    let password = config.default_password()?;
+
     let rustls_cfg = tls::build_rustls_client_config(config.insecure);
     let quic_client_cfg = tls::build_quic_client_config(rustls_cfg)?;
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
         .context("failed to create QUIC client endpoint")?;
     endpoint.set_default_client_config(quic_client_cfg);
 
-    let remote = pool.pick().to_string();
     let sni = if config.sni.is_empty() {
-        remote.rsplit_once(':').map(|(h, _)| h.to_string()).unwrap_or_default()
+        remote_host
+            .rsplit_once(':')
+            .map(|(h, _)| h.to_string())
+            .unwrap_or_default()
     } else {
         config.sni.clone()
     };
 
-    let remote_addr: SocketAddr = tokio::net::lookup_host(&remote)
+    let remote_addr: SocketAddr = tokio::net::lookup_host(&remote_host)
         .await
-        .with_context(|| format!("failed to resolve {}", remote))?
+        .with_context(|| format!("failed to resolve {}", remote_host))?
         .next()
-        .ok_or_else(|| anyhow::anyhow!("no address found for {}", remote))?;
+        .ok_or_else(|| anyhow::anyhow!("no address found for {}", remote_host))?;
 
     info!("[TUIC client] connecting QUIC to {remote_addr} (sni={sni}) ...");
-    let conn = match tokio::time::timeout(Duration::from_secs(10), async {
+    let conn = tokio::time::timeout(Duration::from_secs(10), async {
         endpoint
             .connect(remote_addr, &sni)?
             .await
             .map_err(anyhow::Error::from)
     })
     .await
-    {
-        Ok(Ok(c)) => c,
-        Err(_) | Ok(Err(_)) => {
-            pool.mark_failed(&remote);
-            anyhow::bail!("QUIC connect to {} timed out", remote);
-        }
-    };
+    .context("QUIC connect timed out")??;
     info!("[TUIC client] QUIC connected to {remote_addr}");
 
     // ── Authenticate (unidirectional, sent and forgotten — 0‑RTT) ──────
-    let uuid = derive_uuid(&config.password);
-    let token = derive_token(&conn, &uuid, &config.password)?;
+    let uuid = derive_uuid(&password);
+    let token = derive_token(&conn, &uuid, &password)?;
     {
         let mut s = conn
             .open_uni()

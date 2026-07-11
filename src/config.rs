@@ -1,6 +1,4 @@
 use serde::Deserialize;
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
@@ -13,15 +11,29 @@ fn default_log_level() -> String {
     "info".into()
 }
 
+/// A single remote entry: destination address paired with its authentication
+/// password.  One tunnel can have multiple remotes — the server uses the
+/// password the client presents to decide which target to forward to (port
+/// multiplexing / "端口复用").
+#[derive(Debug, Deserialize, Clone)]
+pub struct RemoteConfig {
+    /// Target address, e.g. "internal-service:443" or "1.2.3.4:8080".
+    pub addr: String,
+    /// Pre-shared password that routes to this target.
+    pub password: String,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct TunnelConfig {
     /// Local listen address, e.g. "[::]:1017" or "0.0.0.0:1017"
     pub listen: String,
 
-    /// Remote addresses as "host:port".  When more than one is listed
-    /// connections are distributed across them with round‑robin.
+    /// New-style remote list.  Each entry pairs a password with a target
+    /// address.  For client tunnels this typically has one entry (pointing
+    /// at the tunnel server); for server tunnels it has one entry per target
+    /// service, enabling port multiplexing.
     #[serde(default)]
-    pub remotes: Vec<String>,
+    pub remotes: Vec<RemoteConfig>,
 
     /// TLS Server Name Indication (SNI) for TLS/QUIC
     pub sni: String,
@@ -30,8 +42,14 @@ pub struct TunnelConfig {
     #[serde(default)]
     pub insecure: bool,
 
-    /// Authentication password
-    pub password: String,
+    // ── Legacy fields (kept for backward compatibility) ──────────────
+    /// @deprecated Use `remotes[0].addr` instead.
+    #[serde(default)]
+    pub remote: Option<String>,
+
+    /// @deprecated Use `remotes[0].password` instead.
+    #[serde(default)]
+    pub password: Option<String>,
 
     /// Path to TLS certificate PEM file (server mode)
     #[serde(default)]
@@ -48,86 +66,49 @@ impl TunnelConfig {
         self.cert.is_some() && self.key.is_some()
     }
 
-    /// Parse the listen address string into a SocketAddr.
-    pub fn listen_addr(&self) -> anyhow::Result<SocketAddr> {
-        self.listen
-            .parse()
-            .map_err(|e| anyhow::anyhow!("invalid listen address '{}': {}", self.listen, e))
-    }
-}
-
-/// Thread‑safe round‑robin remote address selector with basic health
-/// tracking.  Unreachable remotes are skipped for a cooldown period so a
-/// single dead backend doesn't cause every Nth connection to fail.
-#[derive(Debug)]
-pub struct RemotePool {
-    remotes: Vec<String>,
-    next: AtomicUsize,
-    /// Per‑remote unix‑timestamp of the last connection failure, or 0 for
-    /// healthy.  A pick skips any remote that failed within the last 30 s.
-    failures: Vec<AtomicU64>,
-}
-
-/// How long a remote is skipped after a connection failure (seconds).
-const FAILURE_COOLDOWN_SECS: u64 = 30;
-
-impl RemotePool {
-    pub fn new(remotes: Vec<String>) -> Self {
-        assert!(!remotes.is_empty(), "at least one remote required");
-        let n = remotes.len();
-        Self {
-            remotes,
-            next: AtomicUsize::new(0),
-            failures: (0..n).map(|_| AtomicU64::new(0)).collect(),
+    /// Returns the normalised list of remote configurations.
+    ///
+    /// When `remotes` is non-empty it is returned directly.  Otherwise the
+    /// legacy `remote`+`password` pair is used to synthesise a single-entry
+    /// list.
+    pub fn remotes_list(&self) -> anyhow::Result<Vec<RemoteConfig>> {
+        if !self.remotes.is_empty() {
+            return Ok(self.remotes.clone());
         }
-    }
-
-    /// Pick the next healthy remote in round‑robin order.
-    /// If all remotes are currently unhealthy the cooldown is ignored and
-    /// the oldest failure is returned.
-    #[inline]
-    pub fn pick(&self) -> &str {
-        let n = self.remotes.len();
-        let now = now_secs();
-        for _ in 0..n {
-            let idx = self.next.fetch_add(1, Ordering::Relaxed) % n;
-            let last_fail = self.failures[idx].load(Ordering::Relaxed);
-            if last_fail == 0 || now.saturating_sub(last_fail) > FAILURE_COOLDOWN_SECS {
-                return &self.remotes[idx];
-            }
+        if let (Some(remote), Some(password)) = (&self.remote, &self.password) {
+            return Ok(vec![RemoteConfig {
+                addr: remote.clone(),
+                password: password.clone(),
+            }]);
         }
-        // All unhealthy — return the one that failed longest ago.
-        let mut oldest = 0usize;
-        let mut oldest_ts = u64::MAX;
-        for (i, f) in self.failures.iter().enumerate() {
-            let ts = f.load(Ordering::Relaxed);
-            if ts < oldest_ts { oldest_ts = ts; oldest = i; }
-        }
-        &self.remotes[oldest]
+        anyhow::bail!(
+            "tunnel must have either `remotes` (recommended) or `remote`+`password` configured"
+        );
     }
 
-    /// Mark `remote` as unreachable so it is skipped for the cooldown
-    /// period.
-    pub fn mark_failed(&self, remote: &str) {
-        if let Some(pos) = self.remotes.iter().position(|r| r == remote) {
-            self.failures[pos].store(now_secs(), Ordering::Relaxed);
-        }
+    /// Returns the default remote address — the first entry in the remotes
+    /// list.  Used by client-mode tunnels.
+    pub fn default_remote(&self) -> anyhow::Result<String> {
+        self.remotes_list()?
+            .first()
+            .map(|r| r.addr.clone())
+            .ok_or_else(|| anyhow::anyhow!("no remotes configured"))
     }
 
-    /// Return the first remote (useful for one‑time connections like QUIC
-    /// client init where the pool lives across reconnects).
-    #[inline]
-    pub fn first(&self) -> &str {
-        &self.remotes[0]
+    /// Returns the default password — the first entry in the remotes list.
+    /// Used by client-mode tunnels.
+    pub fn default_password(&self) -> anyhow::Result<String> {
+        self.remotes_list()?
+            .first()
+            .map(|r| r.password.clone())
+            .ok_or_else(|| anyhow::anyhow!("no remotes configured"))
     }
-}
 
-fn now_secs() -> u64 {
-    use std::time::SystemTime;
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    /// Returns the remotes list directly (for cases where the caller needs
+    /// both password and addr together, e.g. building a sha256→addr map).
+    pub fn remotes_vec(&self) -> anyhow::Result<Vec<RemoteConfig>> {
+        self.remotes_list()
+    }
 }
 
 /// Load and parse the YAML config file.
@@ -139,9 +120,13 @@ pub fn load_config(path: &str) -> anyhow::Result<Config> {
 
     // Validate tunnel entries
     for (i, t) in config.tunnels.iter().enumerate() {
-        if t.remotes.is_empty() {
-            anyhow::bail!("tunnel[{}]: at least one remote address required", i);
+        // Ensure at least one remote is configured
+        if t.remotes.is_empty() && t.remote.is_none() {
+            anyhow::bail!(
+                "tunnel[{i}]: must have `remotes` (recommended) or `remote`+`password` configured"
+            );
         }
+
         if t.is_server() {
             // Server mode: cert and key files must exist
             let cert_path = t.cert.as_ref().unwrap();
