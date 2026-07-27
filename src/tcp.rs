@@ -359,7 +359,10 @@ impl AnyTlsClient {
     ) -> Result<(Arc<ClientSession>, u32, mpsc::Receiver<StreamEvent>)> {
         let reused = self.idle_pool.lock().await.pop().map(|(_, s)| s);
 
-        let (session, stream_id, rx) = if let Some(session) = reused {
+        // Track whether this session was freshly dialled so that we can
+        // either close it (release FDs) or return it to the idle pool on
+        // SYNACK failure — previously both paths leaked FDs permanently.
+        let (session, stream_id, rx, is_new) = if let Some(session) = reused {
             let stream_id = session.next_stream_id.fetch_add(1, Ordering::Relaxed);
             let (tx, rx) = mpsc::channel(256);
             session.streams.lock().await.insert(stream_id, tx);
@@ -372,36 +375,49 @@ impl AnyTlsClient {
                 // cause of the "Too many open files" after long uptime).
                 session.streams.lock().await.remove(&stream_id);
                 session.active_streams.fetch_sub(1, Ordering::Relaxed);
+                // The writer is dead, so this session is unusable — close
+                // it to release FDs rather than leaking a zombie session.
+                session.close().await;
                 return Err(anyhow!("session writer gone"));
             }
-            (session, stream_id, rx)
+            (session, stream_id, rx, false)
         } else {
-            self.dial_new_session().await?
+            let (s, sid, r) = self.dial_new_session().await?;
+            (s, sid, r, true)
         };
 
         // Wait for cmdSYNACK before handing the stream back to the caller.
         let mut rx = rx;
         let synack = tokio::time::timeout(SYNACK_TIMEOUT, rx.recv()).await;
-        match synack {
-            Ok(Some(StreamEvent::SynAck(Ok(())))) => Ok((session, stream_id, rx)),
-            // Error paths: clean up the stream entry we already registered so
-            // that active_streams and the streams map stay consistent.
-            Ok(Some(StreamEvent::SynAck(Err(msg)))) => {
-                session.streams.lock().await.remove(&stream_id);
-                session.active_streams.fetch_sub(1, Ordering::Relaxed);
-                Err(anyhow!("server rejected stream: {msg}"))
-            }
-            Ok(Some(_)) | Ok(None) => {
-                session.streams.lock().await.remove(&stream_id);
-                session.active_streams.fetch_sub(1, Ordering::Relaxed);
-                Err(anyhow!("session closed before SYNACK"))
-            }
-            Err(_) => {
-                session.streams.lock().await.remove(&stream_id);
-                session.active_streams.fetch_sub(1, Ordering::Relaxed);
-                Err(anyhow!("timed out waiting for SYNACK"))
+        let result = match synack {
+            Ok(Some(StreamEvent::SynAck(Ok(())))) => Ok((session.clone(), stream_id, rx)),
+            Ok(Some(StreamEvent::SynAck(Err(msg)))) => Err(anyhow!("server rejected stream: {msg}")),
+            Ok(Some(_)) | Ok(None) => Err(anyhow!("session closed before SYNACK")),
+            Err(_) => Err(anyhow!("timed out waiting for SYNACK")),
+        };
+
+        if result.is_err() {
+            // SYNACK failed — clean up the stream entry and then either
+            // close the session (if new) or return it to the idle pool
+            // (if reused and still healthy).  Without this cleanup each
+            // failed attempt permanently leaked one TLS socket FD.
+            session.streams.lock().await.remove(&stream_id);
+            let remaining = session.active_streams.fetch_sub(1, Ordering::Relaxed) - 1;
+            if is_new || session.closed.load(Ordering::SeqCst) {
+                // New session with no active streams: close to release FDs.
+                // Also close if the reader already marked it dead.
+                session.close().await;
+            } else if remaining == 0 {
+                // Reused session, still alive, no remaining streams —
+                // return to the idle pool for the next connection.
+                self.idle_pool
+                    .lock()
+                    .await
+                    .push((Instant::now(), session));
             }
         }
+
+        result
     }
 
     async fn dial_new_session(
@@ -774,77 +790,95 @@ async fn serve_session(
 
     let write_tx = spawn_server_writer(tls_write);
     let streams: Arc<Mutex<HashMap<u32, ServerStream>>> = Arc::new(Mutex::new(HashMap::new()));
+    // Track per‑stream relay tasks so they can be aborted when the session
+    // ends — previously they were spawned with bare tokio::spawn and could
+    // become orphaned (holding target TCP FDs indefinitely).
+    let mut stream_tasks = tokio::task::JoinSet::new();
     let mut settings_received = false;
 
     loop {
-        let (cmd, stream_id, data) = read_frame(&mut tls_read).await?;
+        tokio::select! {
+            frame = read_frame(&mut tls_read) => {
+                let (cmd, stream_id, data) = frame?;
 
-        match cmd {
-            CMD_SETTINGS => {
-                settings_received = true;
-                tracing::debug!("[anytls server] client settings: {}", String::from_utf8_lossy(&data));
-                let reply = encode_frame(CMD_SERVER_SETTINGS, 0, b"v=2");
-                if write_tx.send(reply).await.is_err() {
-                    break;
-                }
-            }
-            CMD_SYN => {
-                if !settings_received {
-                    let _ = write_tx.send(encode_frame(
-                        CMD_ALERT,
-                        0,
-                        b"cmdSYN received before cmdSettings",
-                    )).await;
-                    break;
-                }
-                let remote = remote.clone();
-                let write_tx2 = write_tx.clone();
-                let streams2 = streams.clone();
+                match cmd {
+                    CMD_SETTINGS => {
+                        settings_received = true;
+                        tracing::debug!("[anytls server] client settings: {}", String::from_utf8_lossy(&data));
+                        let reply = encode_frame(CMD_SERVER_SETTINGS, 0, b"v=2");
+                        if write_tx.send(reply).await.is_err() {
+                            break;
+                        }
+                    }
+                    CMD_SYN => {
+                        if !settings_received {
+                            let _ = write_tx.send(encode_frame(
+                                CMD_ALERT,
+                                0,
+                                b"cmdSYN received before cmdSettings",
+                            )).await;
+                            break;
+                        }
+                        let remote = remote.clone();
+                        let write_tx2 = write_tx.clone();
+                        let streams2 = streams.clone();
 
-                match TcpStream::connect(remote.as_str()).await {
-                    Ok(target) => {
-                        let (to_remote_tx, to_remote_rx) = mpsc::channel(64);
-                        streams2.lock().await.insert(stream_id, ServerStream { to_remote_tx });
-                        let _ = write_tx2.send(encode_frame(CMD_SYNACK, stream_id, &[])).await;
-                        tokio::spawn(run_server_stream(
-                            target,
-                            stream_id,
-                            write_tx2,
-                            to_remote_rx,
-                            streams2,
-                        ));
+                        match TcpStream::connect(remote.as_str()).await {
+                            Ok(target) => {
+                                let (to_remote_tx, to_remote_rx) = mpsc::channel(64);
+                                streams2.lock().await.insert(stream_id, ServerStream { to_remote_tx });
+                                let _ = write_tx2.send(encode_frame(CMD_SYNACK, stream_id, &[])).await;
+                                stream_tasks.spawn(run_server_stream(
+                                    target,
+                                    stream_id,
+                                    write_tx2,
+                                    to_remote_rx,
+                                    streams2,
+                                ));
+                            }
+                            Err(e) => {
+                                let msg = format!("failed to connect to target: {e}");
+                                let _ = write_tx2.send(encode_frame(CMD_SYNACK, stream_id, msg.as_bytes())).await;
+                            }
+                        }
                     }
-                    Err(e) => {
-                        let msg = format!("failed to connect to target: {e}");
-                        let _ = write_tx2.send(encode_frame(CMD_SYNACK, stream_id, msg.as_bytes())).await;
+                    CMD_PSH => {
+                        if let Some(s) = streams.lock().await.get(&stream_id) {
+                            let _ = s.to_remote_tx.send(ServerStreamMsg::Data(data)).await;
+                        }
                     }
+                    CMD_FIN => {
+                        if let Some(s) = streams.lock().await.remove(&stream_id) {
+                            let _ = s.to_remote_tx.send(ServerStreamMsg::Fin).await;
+                        }
+                    }
+                    CMD_HEART_REQUEST => {
+                        let _ = write_tx.send(encode_frame(CMD_HEART_RESPONSE, 0, &[])).await;
+                    }
+                    CMD_HEART_RESPONSE | CMD_WASTE => {}
+                    CMD_ALERT => {
+                        tracing::warn!("[anytls server] client alert: {}", String::from_utf8_lossy(&data));
+                        break;
+                    }
+                    _ => {}
                 }
             }
-            CMD_PSH => {
-                if let Some(s) = streams.lock().await.get(&stream_id) {
-                    let _ = s.to_remote_tx.send(ServerStreamMsg::Data(data)).await;
-                }
+            // Periodically reap finished stream tasks so JoinHandle
+            // allocations don't accumulate unboundedly.
+            _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                while stream_tasks.try_join_next().is_some() {}
             }
-            CMD_FIN => {
-                if let Some(s) = streams.lock().await.remove(&stream_id) {
-                    let _ = s.to_remote_tx.send(ServerStreamMsg::Fin).await;
-                }
-            }
-            CMD_HEART_REQUEST => {
-                let _ = write_tx.send(encode_frame(CMD_HEART_RESPONSE, 0, &[])).await;
-            }
-            CMD_HEART_RESPONSE | CMD_WASTE => {}
-            CMD_ALERT => {
-                tracing::warn!("[anytls server] client alert: {}", String::from_utf8_lossy(&data));
-                break;
-            }
-            _ => {}
         }
     }
 
+    // Notify all remaining streams that the session is closing, then abort
+    // any relay tasks still in flight so their target TCP FDs are released
+    // promptly.
     for (_, s) in streams.lock().await.drain() {
         let _ = s.to_remote_tx.send(ServerStreamMsg::Fin).await;
     }
+    stream_tasks.abort_all();
+    while stream_tasks.join_next().await.is_some() {}
     Ok(())
 }
 
