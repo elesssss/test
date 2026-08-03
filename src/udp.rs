@@ -579,6 +579,19 @@ async fn handle_tuic_connection(
     }
 
     janitor_handle.abort();
+
+    // Drain every remaining assoc so that reply-pump tasks and their UDP
+    // sockets are released promptly.  Without this, each QUIC connection
+    // that dies (idle timeout, network loss, …) leaves behind one zombie
+    // reply-pump task per assoc, each holding a UDP socket FD — a slow
+    // leak that eventually exhausts the process file-descriptor limit.
+    let remaining: Vec<_> = assocs.lock().await.drain().map(|(_, a)| a).collect();
+    for assoc in remaining {
+        if let Some(handle) = assoc.reply_handle.lock().await.take() {
+            handle.abort();
+        }
+    }
+
     Ok(())
 }
 
@@ -926,10 +939,14 @@ pub async fn run_udp_client(config: &TunnelConfig) -> anyhow::Result<()> {
     }
     heartbeat_handle.abort();
 
-    // Best‑effort Dissociate on the way out.
-    let mut s = conn.open_uni().await?;
-    let _ = s.write_all(&build_dissociate(assoc_id)).await;
-    let _ = s.finish();
+    // Best‑effort Dissociate on the way out — the QUIC connection may
+    // already be dead (timeout, network loss), so ignore errors here.
+    // We don't want the Dissociate failure to mask the real reason the
+    // tunnel ended.
+    if let Ok(mut s) = conn.open_uni().await {
+        let _ = s.write_all(&build_dissociate(assoc_id)).await;
+        let _ = s.finish();
+    }
 
     info!("[TUIC client] tunnel ended");
     Ok(())

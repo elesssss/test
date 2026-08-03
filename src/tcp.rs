@@ -799,7 +799,15 @@ async fn serve_session(
     loop {
         tokio::select! {
             frame = read_frame(&mut tls_read) => {
-                let (cmd, stream_id, data) = frame?;
+                // Don't use `?` here — returning early would skip the
+                // stream_tasks cleanup below, leaking target TCP FDs.
+                let (cmd, stream_id, data) = match frame {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::debug!("[anytls server] read_frame error: {e}");
+                        break;
+                    }
+                };
 
                 match cmd {
                     CMD_SETTINGS => {
