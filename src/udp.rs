@@ -579,6 +579,19 @@ async fn handle_tuic_connection(
     }
 
     janitor_handle.abort();
+
+    // Drain every remaining assoc so that reply-pump tasks and their UDP
+    // sockets are released promptly.  Without this, each QUIC connection
+    // that dies (idle timeout, network loss, …) leaves behind one zombie
+    // reply-pump task per assoc, each holding a UDP socket FD — a slow
+    // leak that eventually exhausts the process file-descriptor limit.
+    let remaining: Vec<_> = assocs.lock().await.drain().map(|(_, a)| a).collect();
+    for assoc in remaining {
+        if let Some(handle) = assoc.reply_handle.lock().await.take() {
+            handle.abort();
+        }
+    }
+
     Ok(())
 }
 
@@ -826,12 +839,6 @@ pub async fn run_udp_client(config: &TunnelConfig) -> anyhow::Result<()> {
     let remote_host = config.default_remote()?;
     let password = config.default_password()?;
 
-    let rustls_cfg = tls::build_rustls_client_config(config.insecure);
-    let quic_client_cfg = tls::build_quic_client_config(rustls_cfg)?;
-    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
-        .context("failed to create QUIC client endpoint")?;
-    endpoint.set_default_client_config(quic_client_cfg);
-
     let sni = if config.sni.is_empty() {
         remote_host
             .rsplit_once(':')
@@ -841,98 +848,186 @@ pub async fn run_udp_client(config: &TunnelConfig) -> anyhow::Result<()> {
         config.sni.clone()
     };
 
-    let remote_addr: SocketAddr = tokio::net::lookup_host(&remote_host)
-        .await
-        .with_context(|| format!("failed to resolve {}", remote_host))?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no address found for {}", remote_host))?;
+    // Reconnection loop: if the QUIC connection drops (timeout, network
+    // blip, server restart) we retry with exponential backoff instead of
+    // dying permanently.
+    let mut retry_delay = Duration::from_secs(1);
+    const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 
-    info!("[TUIC client] connecting QUIC to {remote_addr} (sni={sni}) ...");
-    let conn = tokio::time::timeout(Duration::from_secs(10), async {
-        endpoint
-            .connect(remote_addr, &sni)?
-            .await
-            .map_err(anyhow::Error::from)
-    })
-    .await
-    .context("QUIC connect timed out")??;
-    info!("[TUIC client] QUIC connected to {remote_addr}");
-
-    // ── Authenticate (unidirectional, sent and forgotten — 0‑RTT) ──────
-    let uuid = derive_uuid(&password);
-    let token = derive_token(&conn, &uuid, &password)?;
-    {
-        let mut s = conn
-            .open_uni()
-            .await
-            .context("failed to open auth stream")?;
-        s.write_all(&build_authenticate(&uuid, &token))
-            .await
-            .context("failed to write Authenticate")?;
-        s.finish().context("failed to finish auth stream")?;
-    }
-    info!("[TUIC client] auth ok");
-
-    let assoc_id: u16 = 1;
-    let pkt_id_ctr = Arc::new(AtomicU16::new(0));
-    let conn = Arc::new(conn);
-
-    // Transport mode for Packet commands.  Defaults to datagram (lossy) to
-    // match the most common TUIC deployment.  Switch to `RelayMode::Stream`
-    // for ordered/lossless delivery.
-    let relay_mode = RelayMode::Datagram;
-
-    // Shared between the two relay directions: `local_udp_to_quic` updates
-    // this every time it sees a datagram from the local client, so
-    // `quic_to_local_udp` knows where to write replies back to.
-    let last_peer: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
-
-    // Heartbeat: keep NAT/QUIC‑path state alive at the application layer
-    // (always sent as QUIC datagram per TUIC v5 spec).
-    let heartbeat_handle = {
-        let conn2 = conn.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(HEARTBEAT_INTERVAL).await;
-                if conn2
-                    .send_datagram(Bytes::from(build_heartbeat()))
-                    .is_err()
-                {
-                    break;
+    loop {
+        // Re‑resolve DNS each attempt (the server IP may have changed).
+        let remote_addr: SocketAddr = match tokio::net::lookup_host(&remote_host).await {
+            Ok(mut addrs) => match addrs.next() {
+                Some(a) => a,
+                None => {
+                    tracing::warn!(
+                        "[TUIC client] DNS resolved no addresses for {remote_host}, retrying in {}s ...",
+                        retry_delay.as_secs()
+                    );
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
+                    continue;
                 }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    "[TUIC client] DNS resolve failed for {remote_host}: {e}, retrying in {}s ...",
+                    retry_delay.as_secs()
+                );
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
+                continue;
             }
+        };
+
+        let rustls_cfg = tls::build_rustls_client_config(config.insecure);
+        let quic_client_cfg = match tls::build_quic_client_config(rustls_cfg) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("[TUIC client] failed to build QUIC config: {e}");
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
+                continue;
+            }
+        };
+        let mut endpoint = match quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()) {
+            Ok(ep) => ep,
+            Err(e) => {
+                tracing::warn!("[TUIC client] failed to create QUIC endpoint: {e}");
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
+                continue;
+            }
+        };
+        endpoint.set_default_client_config(quic_client_cfg);
+
+        tracing::info!("[TUIC client] connecting QUIC to {remote_addr} (sni={sni}) ...");
+        let conn = match tokio::time::timeout(Duration::from_secs(10), async {
+            endpoint
+                .connect(remote_addr, &sni)?
+                .await
+                .map_err(anyhow::Error::from)
         })
-    };
+        .await
+        {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    "[TUIC client] QUIC connect to {remote_addr} failed: {e}, retrying in {}s ...",
+                    retry_delay.as_secs()
+                );
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
+                continue;
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    "[TUIC client] QUIC connect to {remote_addr} timed out, retrying in {}s ...",
+                    retry_delay.as_secs()
+                );
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
+                continue;
+            }
+        };
 
-    let mut l2q = tokio::spawn(local_udp_to_quic(
-        local.clone(),
-        conn.clone(),
-        assoc_id,
-        pkt_id_ctr.clone(),
-        last_peer.clone(),
-        relay_mode,
-    ));
-    let mut q2l = tokio::spawn(quic_to_local_udp(
-        local,
-        conn.clone(),
-        assoc_id,
-        last_peer,
-    ));
+        // ── Authenticate (0‑RTT) ────────────────────────────────────────
+        let uuid = derive_uuid(&password);
+        let token = match derive_token(&conn, &uuid, &password) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("[TUIC client] token derivation failed: {e}, retrying ...");
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
+                continue;
+            }
+        };
+        {
+            let mut s = match conn.open_uni().await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("[TUIC client] failed to open auth stream: {e}, retrying ...");
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
+                    continue;
+                }
+            };
+            if let Err(e) = s.write_all(&build_authenticate(&uuid, &token)).await {
+                tracing::warn!("[TUIC client] failed to write Authenticate: {e}, retrying ...");
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
+                continue;
+            }
+            if let Err(e) = s.finish() {
+                tracing::warn!("[TUIC client] failed to finish auth stream: {e}, retrying ...");
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
+                continue;
+            }
+        }
+        tracing::info!("[TUIC client] QUIC connected to {remote_addr}, auth ok");
 
-    // Whichever direction ends first brings the other one down too.
-    tokio::select! {
-        _ = &mut l2q => { q2l.abort(); }
-        _ = &mut q2l => { l2q.abort(); }
+        // Successful connection — reset backoff.
+        retry_delay = Duration::from_secs(1);
+
+        let assoc_id: u16 = 1;
+        let pkt_id_ctr = Arc::new(AtomicU16::new(0));
+        let conn = Arc::new(conn);
+
+        let relay_mode = RelayMode::Datagram;
+        let last_peer: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+
+        // Heartbeat: keep NAT/QUIC‑path state alive.
+        let heartbeat_handle = {
+            let conn2 = conn.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+                    if conn2
+                        .send_datagram(Bytes::from(build_heartbeat()))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+        };
+
+        let mut l2q = tokio::spawn(local_udp_to_quic(
+            local.clone(),
+            conn.clone(),
+            assoc_id,
+            pkt_id_ctr.clone(),
+            last_peer.clone(),
+            relay_mode,
+        ));
+        let mut q2l = tokio::spawn(quic_to_local_udp(
+            local.clone(),
+            conn.clone(),
+            assoc_id,
+            last_peer,
+        ));
+
+        // Whichever direction ends first brings the other one down.
+        tokio::select! {
+            _ = &mut l2q => { q2l.abort(); }
+            _ = &mut q2l => { l2q.abort(); }
+        }
+        heartbeat_handle.abort();
+
+        // Best‑effort Dissociate on the way out.
+        if let Ok(mut s) = conn.open_uni().await {
+            let _ = s.write_all(&build_dissociate(assoc_id)).await;
+            let _ = s.finish();
+        }
+
+        tracing::warn!(
+            "[TUIC client] relay ended, reconnecting in {}s ...",
+            retry_delay.as_secs()
+        );
+        tokio::time::sleep(retry_delay).await;
+        retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
     }
-    heartbeat_handle.abort();
-
-    // Best‑effort Dissociate on the way out.
-    let mut s = conn.open_uni().await?;
-    let _ = s.write_all(&build_dissociate(assoc_id)).await;
-    let _ = s.finish();
-
-    info!("[TUIC client] tunnel ended");
-    Ok(())
 }
 
 /// local UDP recv → wrap as Packet(s) → send via QUIC (datagram or stream).

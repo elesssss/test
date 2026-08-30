@@ -67,6 +67,11 @@ const IDLE_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 const SYNACK_TIMEOUT: Duration = Duration::from_secs(10);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
 
+/// Hard cap on concurrent local connections (client) or TLS sessions
+/// (server).  Together with the idle-pool cap of 64 this keeps total FDs
+/// comfortably under the typical Linux default ulimit of 1 024.
+const MAX_CONCURRENT: usize = 512;
+
 // ── Frame encode / decode ──────────────────────────────────────────────────
 
 fn encode_frame(cmd: u8, stream_id: u32, data: &[u8]) -> Vec<u8> {
@@ -108,6 +113,11 @@ pub async fn run_tcp_client(cfg: &TunnelConfig) -> Result<()> {
         .with_context(|| format!("failed to bind TCP listen address {}", cfg.listen))?;
     tracing::info!("[anytls client] listening on {}", cfg.listen);
 
+    // Semaphore bounds the number of in‑flight local connections so that
+    // a connection burst (or a slow FD leak elsewhere) cannot exhaust the
+    // process file‑descriptor limit and take down the listener.
+    let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT));
+
     // JoinSet tracks per‑connection tasks for clean shutdown (sing‑box
     // pattern: closing the listener cascades to all accepted connections).
     let mut tasks = tokio::task::JoinSet::new();
@@ -122,8 +132,13 @@ pub async fn run_tcp_client(cfg: &TunnelConfig) -> Result<()> {
                         break;
                     }
                 };
+                let permit = match sem.clone().acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
                 let client = client.clone();
                 tasks.spawn(async move {
+                    let _permit = permit; // released when task completes
                     if let Err(e) = client.handle_local_conn(local).await {
                         tracing::debug!("[anytls client] connection from {peer} ended: {e:#}");
                     }
@@ -165,6 +180,10 @@ pub async fn run_tcp_server(cfg: &TunnelConfig) -> Result<()> {
             .collect(),
     );
 
+    // Semaphore bounds concurrent TLS sessions (and thus total target TCP
+    // connections) to prevent file‑descriptor exhaustion under load.
+    let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT));
+
     // JoinSet tracks all per‑session tasks so they can be aborted when the
     // listener exits (matching sing‑box: closing the listener cascades to
     // close all accepted connections).
@@ -180,10 +199,15 @@ pub async fn run_tcp_server(cfg: &TunnelConfig) -> Result<()> {
                         break;
                     }
                 };
+                let permit = match sem.clone().acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
                 let acceptor = acceptor.clone();
                 let auth_map = auth_map.clone();
 
                 tasks.spawn(async move {
+                    let _permit = permit; // released when session completes
                     let tls = match acceptor.accept(stream).await {
                         Ok(t) => t,
                         Err(e) => {
@@ -486,11 +510,19 @@ impl AnyTlsClient {
         );
         let mut packet1 = encode_frame(CMD_SETTINGS, 0, settings_data.as_bytes());
         packet1.extend_from_slice(&encode_frame(CMD_SYN, stream_id, &[]));
-        session
+        if session
             .write_tx
             .send(packet1)
             .await
-            .map_err(|_| anyhow!("session writer gone immediately after dial"))?;
+            .is_err()
+        {
+            // Writer died before we could send the opening frame — the
+            // reader task still holds tls_read (an open TLS socket FD),
+            // so we must explicitly close the session or it becomes a
+            // zombie that leaks that FD permanently.
+            session.close().await;
+            return Err(anyhow!("session writer gone immediately after dial"));
+        }
 
         let hb_handle = spawn_heartbeat(session.clone());
         *session.heartbeat_handle.lock().await = Some(hb_handle);
@@ -733,7 +765,26 @@ async fn run_client_stream(
         let _ = local_w.shutdown().await;
     };
 
-    tokio::join!(upload, download);
+    // Use `select!` instead of `join!` so that when one direction finishes
+    // the other is cancelled and cleanup runs promptly.  With `join!`, if
+    // the server closes the stream (download gets Fin) while the local
+    // client is still connected, the upload half blocks forever on
+    // `local_r.read()` — the stream never completes, active_streams is
+    // never decremented, and the session (with its TLS socket FD) is
+    // permanently stuck outside the idle pool.
+    tokio::select! {
+        _ = upload => {
+            // Local client disconnected first — upload already sent
+            // CMD_FIN before exiting.  The download future is dropped
+            // (closing local_w).
+        }
+        _ = download => {
+            // Server closed the stream first — download received Fin
+            // and shut down local_w.  The upload future is dropped
+            // (closing local_r).  CMD_FIN was not sent, but the server
+            // already tore down its side so it doesn't need one.
+        }
+    }
 
     session.streams.lock().await.remove(&stream_id);
     session.active_streams.fetch_sub(1, Ordering::Relaxed);
@@ -799,7 +850,15 @@ async fn serve_session(
     loop {
         tokio::select! {
             frame = read_frame(&mut tls_read) => {
-                let (cmd, stream_id, data) = frame?;
+                // Don't use `?` here — returning early would skip the
+                // stream_tasks cleanup below, leaking target TCP FDs.
+                let (cmd, stream_id, data) = match frame {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::debug!("[anytls server] read_frame error: {e}");
+                        break;
+                    }
+                };
 
                 match cmd {
                     CMD_SETTINGS => {
