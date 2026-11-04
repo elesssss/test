@@ -244,7 +244,8 @@ func (s *ClientService) preserveServerOwnedFields(tx *gorm.DB, client *model.Cli
 	client.CreatedAt = existing.CreatedAt
 	client.OnlineAt = existing.OnlineAt
 
-	if client.Up == 0 && client.Down == 0 {
+	if client.ResetUsage {
+		client.Up, client.Down = 0, 0
 		client.TotalUp = existing.TotalUp + existing.Up
 		client.TotalDown = existing.TotalDown + existing.Down
 		return
@@ -482,26 +483,23 @@ func (s *ClientService) UpdateLinksByInboundChange(tx *gorm.DB, inbounds *[]mode
 }
 
 func (s *ClientService) DepleteClients() ([]uint, error) {
+	var ids []uint
+	err := database.GetDB().Transaction(func(tx *gorm.DB) error {
+		var err error
+		ids, err = s.depleteClientsAt(tx, time.Now().Unix())
+		return err
+	})
+	if err == nil {
+		LastUpdate.Store(time.Now().Unix())
+	}
+	return ids, err
+}
+
+func (s *ClientService) depleteClientsAt(tx *gorm.DB, dt int64) ([]uint, error) {
 	var err error
 	var clients []model.Client
 	var changes []model.Changes
-	var users []string
 	var inboundIds []uint
-
-	dt := time.Now().Unix()
-	db := database.GetDB()
-
-	tx := db.Begin()
-	defer func() {
-		if err == nil {
-			tx.Commit()
-			if err1 := db.Exec("PRAGMA wal_checkpoint(FULL)").Error; err1 != nil {
-				logger.Error("Error checkpointing WAL: ", err1.Error())
-			}
-		} else {
-			tx.Rollback()
-		}
-	}()
 
 	// Reset clients
 	inboundIds, err = s.ResetClients(tx, dt)
@@ -517,7 +515,6 @@ func (s *ClientService) DepleteClients() ([]uint, error) {
 
 	for _, client := range clients {
 		logger.Debug("Client ", client.Name, " is going to be disabled")
-		users = append(users, client.Name)
 		var userInbounds []uint
 		json.Unmarshal(client.Inbounds, &userInbounds)
 		// Find changed inbounds
@@ -541,7 +538,6 @@ func (s *ClientService) DepleteClients() ([]uint, error) {
 		if err != nil {
 			return nil, err
 		}
-		LastUpdate.Store(dt)
 	}
 
 	return inboundIds, nil
@@ -633,17 +629,23 @@ func (s *ClientService) ResetClients(tx *gorm.DB, dt int64) ([]uint, error) {
 		if err != nil {
 			return nil, err
 		}
-		LastUpdate.Store(dt)
 	}
 	return inboundIds, nil
 }
 
 // ResetAllClientsTraffic zeroes up/down for every client (accumulating into the
 // total counters) and re-enables all of them, in a single bulk update. Used by
-// the global periodic traffic reset; the caller restarts the core afterwards so
-// re-enabled clients take effect.
+// the global periodic traffic reset. Runtime callers use ConfigService.ResetTraffic
+// to coordinate authentication changes with this transaction.
 func (s *ClientService) ResetAllClientsTraffic() error {
-	db := database.GetDB()
+	err := database.GetDB().Transaction(func(tx *gorm.DB) error { return s.resetAllClientsTrafficAt(tx) })
+	if err == nil {
+		LastUpdate.Store(time.Now().Unix())
+	}
+	return err
+}
+
+func (s *ClientService) resetAllClientsTrafficAt(db *gorm.DB) error {
 	dt := time.Now().Unix()
 
 	result := db.Model(model.Client{}).
@@ -669,7 +671,6 @@ func (s *ClientService) ResetAllClientsTraffic() error {
 		}).Error; err != nil {
 			return err
 		}
-		LastUpdate.Store(dt)
 	}
 
 	return nil

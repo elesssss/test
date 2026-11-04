@@ -61,21 +61,6 @@ func (s *TlsService) Save(tx *gorm.DB, action string, data json.RawMessage, host
 				if err != nil {
 					return common.NewError("unable to update out_json of inbounds: ", err.Error())
 				}
-				err = s.InboundService.RestartInbounds(tx, inboundIds)
-				if err != nil {
-					return err
-				}
-			}
-			var serviceIds []uint
-			err = tx.Model(model.Service{}).Where("tls_id = ?", tls.Id).Scan(&serviceIds).Error
-			if err != nil {
-				return err
-			}
-			if len(serviceIds) > 0 {
-				err = s.ServicesService.RestartServices(tx, serviceIds)
-				if err != nil {
-					return err
-				}
 			}
 		}
 	case "del":

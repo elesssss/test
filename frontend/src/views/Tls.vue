@@ -392,11 +392,7 @@ const delTls = async (id: number) => {
 // back through the config object as a whole, the same way the rules page does.
 const appConfig = computed((): ConfigWithProviders => Data().config)
 
-const providers = computed((): certProvider[] => {
-  const config = appConfig.value
-  if (!Array.isArray(config.certificate_providers)) config.certificate_providers = []
-  return config.certificate_providers
-})
+const providers = computed((): certProvider[] => appConfig.value.certificate_providers ?? [])
 
 const providerTags = computed((): string[] => providers.value.map(p => p.tag))
 
@@ -422,30 +418,34 @@ const showProviderModal = (index: number) => {
 const closeProviderModal = () => { providerModal.value.visible = false }
 
 const saveProviderModal = async (data: certProvider) => {
+  const next = JSON.parse(JSON.stringify(providers.value)) as certProvider[]
   const index = providerModal.value.index
-  if (index == -1) providers.value.push(data)
-  else providers.value[index] = data
-  const success = await saveProviders()
-  if (success) providerModal.value.visible = false
+  if (index == -1) next.push(data)
+  else next[index] = data
+  if (await saveProviders(next)) providerModal.value.visible = false
 }
 
 const cloneProvider = async (index: number) => {
   const copy = <certProvider>JSON.parse(JSON.stringify(providers.value[index]))
   while (providerTags.value.includes(copy.tag)) copy.tag += "-copy"
-  providers.value.push(copy)
-  await saveProviders()
+  await saveProviders([...providers.value, copy])
 }
 
 const delProvider = async (index: number) => {
-  providers.value.splice(index, 1)
-  const success = await saveProviders()
-  if (success) delProviderOverlay.value[index] = false
+  const next = providers.value.filter((_, i) => i != index)
+  if (await saveProviders(next)) delProviderOverlay.value[index] = false
 }
 
-const saveProviders = async (): Promise<boolean> => {
+const saveProviders = async (next: certProvider[]): Promise<boolean> => {
+  if (providerLoading.value) return false
   providerLoading.value = true
-  const success = await Data().save("config", "set", appConfig.value)
-  providerLoading.value = false
-  return success
+  try {
+    // Send a detached candidate; only a successful API response updates Pinia.
+    const candidate = JSON.parse(JSON.stringify(appConfig.value))
+    candidate.certificate_providers = next
+    return await Data().save("config", "set", candidate)
+  } finally {
+    providerLoading.value = false
+  }
 }
 </script>

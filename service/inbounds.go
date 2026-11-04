@@ -3,13 +3,11 @@ package service
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 
 	"github.com/alireza0/s-ui/database"
 	"github.com/alireza0/s-ui/database/model"
-	"github.com/alireza0/s-ui/logger"
 	"github.com/alireza0/s-ui/util"
 	"github.com/alireza0/s-ui/util/common"
 
@@ -383,95 +381,4 @@ func (s *InboundService) enabledClientNames(tx *gorm.DB, inboundId uint) (map[st
 		keep[name] = struct{}{}
 	}
 	return keep, nil
-}
-
-func (s *InboundService) UpdateInboundsUsers(tx *gorm.DB, ids []uint) error {
-	// Held for the whole loop below, which interleaves DB queries with core
-	// calls. Re-reading the instance after each query would let a restart
-	// swap the box mid-loop; a nil here just means the core is down.
-	box := corePtr.GetInstance()
-	if box == nil {
-		return nil
-	}
-	if len(ids) == 0 {
-		return nil
-	}
-	inbounds, err := s.enabledInbounds(tx, ids)
-	if err != nil {
-		return err
-	}
-	for _, inbound := range inbounds {
-		inboundConfig, err := inbound.MarshalJSON()
-		if err != nil {
-			return err
-		}
-		inboundConfig, err = s.addUsers(tx, inboundConfig, inbound.Id, inbound.Type)
-		if err != nil {
-			return err
-		}
-
-		handled, err := corePtr.UpdateInboundUsers(inboundConfig)
-		if err != nil {
-			return err
-		}
-		if handled {
-			// Disconnect only users no longer enabled on this inbound
-			keep, err := s.enabledClientNames(tx, inbound.Id)
-			if err != nil {
-				return err
-			}
-			closed := box.SessionTracker().CloseByInboundUsers(inbound.Tag, keep)
-			cut := corePtr.CloseInboundUserSessions(inbound.Tag, keep)
-			logger.Debug("updated users of inbound ", inbound.Tag, " in place, closed ", closed, " stale connections and ", cut, " sessions")
-			continue
-		}
-
-		// Fallback: full restart for protocols without in-place user updates
-		err = corePtr.RemoveInbound(inbound.Tag)
-		if err != nil && err != os.ErrInvalid {
-			return err
-		}
-		box.SessionTracker().CloseByInbound(inbound.Tag)
-		err = corePtr.AddInbound(inboundConfig)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (s *InboundService) RestartInbounds(tx *gorm.DB, ids []uint) error {
-	box := corePtr.GetInstance()
-	if box == nil {
-		return nil
-	}
-	if len(ids) == 0 {
-		return nil
-	}
-	inbounds, err := s.enabledInbounds(tx, ids)
-	if err != nil {
-		return err
-	}
-	for _, inbound := range inbounds {
-		err = corePtr.RemoveInbound(inbound.Tag)
-		if err != nil && err != os.ErrInvalid {
-			return err
-		}
-		// Close all existing connections
-		box.SessionTracker().CloseByInbound(inbound.Tag)
-
-		inboundConfig, err := inbound.MarshalJSON()
-		if err != nil {
-			return err
-		}
-		inboundConfig, err = s.addUsers(tx, inboundConfig, inbound.Id, inbound.Type)
-		if err != nil {
-			return err
-		}
-		err = corePtr.AddInbound(inboundConfig)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
 }

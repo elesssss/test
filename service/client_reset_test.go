@@ -210,11 +210,12 @@ func TestResetUsageThroughTheClientForm(t *testing.T) {
 
 	// What the reset button posts: counters zeroed, everything else as shown.
 	reset := &model.Client{
-		Id:     c.Id,
-		Name:   "someone",
-		Enable: true,
-		Up:     0,
-		Down:   0,
+		ResetUsage: true,
+		Id:         c.Id,
+		Name:       "someone",
+		Enable:     true,
+		Up:         0,
+		Down:       0,
 	}
 	s.preserveServerOwnedFields(db, reset)
 
@@ -249,11 +250,12 @@ func TestResetUsageCountsTrafficArrivingWhileOpen(t *testing.T) {
 
 	// A form rendered before that, with the totals it computed for itself.
 	reset := &model.Client{
-		Id:        c.Id,
-		Name:      "someone",
-		Enable:    true,
-		TotalUp:   1_500,
-		TotalDown: 1_000,
+		ResetUsage: true,
+		Id:         c.Id,
+		Name:       "someone",
+		Enable:     true,
+		TotalUp:    1_500,
+		TotalDown:  1_000,
 	}
 	s.preserveServerOwnedFields(db, reset)
 
@@ -262,8 +264,8 @@ func TestResetUsageCountsTrafficArrivingWhileOpen(t *testing.T) {
 	}
 }
 
-// A periodic reset that re-enables a depleted client must move LastUpdate, or
-// the panel never reloads and keeps showing the client as disabled (#1287).
+// Periodic resets write an audit revision in the same transaction. The global
+// notification is emitted only by the coordinating caller after commit.
 func TestPeriodicResetReenablesAndAnnounces(t *testing.T) {
 	db := clientTestDB(t)
 	s := &ClientService{}
@@ -295,7 +297,11 @@ func TestPeriodicResetReenablesAndAnnounces(t *testing.T) {
 	if len(ids) != 1 || ids[0] != 7 {
 		t.Errorf("expected its inbound to be updated, got %v", ids)
 	}
-	if LastUpdate.Load() != now {
-		t.Errorf("LastUpdate = %d, want %d so the panel reloads", LastUpdate.Load(), now)
+	var count int64
+	if err := db.Model(model.Changes{}).Where("actor = ? AND action = ?", "ResetJob", "reset").Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count == 0 {
+		t.Error("periodic reset did not write its revision")
 	}
 }

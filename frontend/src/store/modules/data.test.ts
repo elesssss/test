@@ -59,11 +59,16 @@ describe('setNewData with a partial payload', () => {
     expect(store.clients).toHaveLength(0)
   })
 
-  it('stamps the load time so the next poll can ask for changes only', () => {
+  it('uses a server revision instead of the browser clock', () => {
     const store = Data()
     expect(store.lastLoad).toBe(0)
-    store.setNewData({} as LoadedData)
-    expect(store.lastLoad).toBeGreaterThan(0)
+    store.setNewData({ config: {}, revision: 'r:test:1' } as LoadedData)
+    expect(store.lastLoad).toBe(1)
+    expect(store.revision).toBe('r:test:1')
+    store.setNewData({ clients: [] } as LoadedData)
+    expect(store.revision).toBe('r:test:1')
+    store.setNewData({ config: {}, revision: 'r:test:2' } as LoadedData)
+    expect(store.revision).toBe('r:test:2')
   })
 })
 

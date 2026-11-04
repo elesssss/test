@@ -55,6 +55,7 @@ func TestExtractReleaseIgnoresOtherPaths(t *testing.T) {
 	tw := tar.NewWriter(gz)
 	for name, body := range map[string]string{
 		"s-ui/sui":          "bin",
+		"s-ui/libcronet.so": "library",
 		"s-ui/s-ui.sh":      "sh",
 		"../sui":            "evil",
 		"s-ui/../../x":      "evil",
@@ -74,14 +75,20 @@ func TestExtractReleaseIgnoresOtherPaths(t *testing.T) {
 		t.Fatal(err)
 	}
 	entries, _ := os.ReadDir(out)
-	if len(entries) != 3 {
-		t.Fatalf("extracted %d files, want 3", len(entries))
+	if len(entries) != 2 {
+		t.Fatalf("extracted %d payloads, want 2", len(entries))
 	}
 	if b, _ := os.ReadFile(filepath.Join(out, "sui")); string(b) != "bin" {
 		t.Errorf("sui = %q", b)
 	}
-	if b, _ := os.ReadFile(filepath.Join(out, "s-ui.sh")); string(b) != "sh" {
-		t.Errorf("s-ui.sh = %q", b)
+	if b, _ := os.ReadFile(filepath.Join(out, "libcronet.so")); string(b) != "library" {
+		t.Errorf("library = %q", b)
+	}
+	if _, err := os.Stat(filepath.Join(out, "s-ui.sh")); !os.IsNotExist(err) {
+		t.Error("menu script must not be extracted for replacement")
+	}
+	if _, err := os.Stat(filepath.Join(out, systemdUnit)); !os.IsNotExist(err) {
+		t.Error("custom unit must not be extracted for replacement")
 	}
 	if _, err := os.Stat(filepath.Join(dir, "x")); err == nil {
 		t.Error("an entry escaped the destination")

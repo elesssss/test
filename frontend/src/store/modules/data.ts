@@ -24,6 +24,7 @@ export interface Onlines {
 // only when something actually changed since the last one, which is why every
 // field here is optional and setNewData tests for presence before assigning.
 export interface LoadedData {
+  revision?: string
   onlines?: Onlines
   maintenance?: boolean
   lastLog?: string
@@ -58,6 +59,7 @@ type Tagged = Inbound | Outbound | Srv | Endpoint
 const Data = defineStore('Data', {
   state: () => ({ 
     lastLoad: 0,
+    revision: '',
     reloadItems: localStorage.getItem("reloadItems")?.split(',')?? <string[]>[],
     subURI: "",
     os: "",
@@ -79,7 +81,7 @@ const Data = defineStore('Data', {
   }),
   actions: {
     async loadData() {
-      const msg = await HttpUtils.get<LoadedData>('api/load', this.lastLoad >0 ? {lu: this.lastLoad} : {} )
+      const msg = await HttpUtils.get<LoadedData>('api/load', this.revision ? {lu: this.revision} : {} )
       if(msg.success) {
         if (msg.obj.onlines) this.onlines = msg.obj.onlines
         this.maintenance = msg.obj.maintenance ?? false
@@ -101,7 +103,9 @@ const Data = defineStore('Data', {
       if (msg.success && msg.obj?.hasUpdate) this.update = msg.obj
     },
     setNewData(data: LoadedData) {
-      this.lastLoad = Math.floor((new Date()).getTime()/1000)
+      // lastLoad remains a UI-ready flag. It is no longer a synchronization cursor.
+      if (data.config) this.lastLoad = 1
+      if (data.config && data.revision) this.revision = data.revision
       if (data.subURI) this.subURI = data.subURI
       if (data.os) this.os = data.os
       // hasOwn, not truthiness: turning traffic accounting off sends false,

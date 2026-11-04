@@ -1,6 +1,8 @@
 package core
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"reflect"
@@ -53,7 +55,7 @@ func (c *Core) PreparePolicy(raw []byte) (*PolicyUpdate, error) {
 	if err != nil {
 		return nil, err
 	}
-	var options   option.Options
+	var options option.Options
 	if err := options.UnmarshalJSONContext(c.ctx, raw); err != nil {
 		return nil, err
 	}
@@ -83,6 +85,19 @@ func (c *Core) PreparePolicy(raw []byte) (*PolicyUpdate, error) {
 	}
 	if options.Experimental != nil && options.Experimental.CacheFile != nil && options.Experimental.CacheFile.Enabled {
 		return nil, fmt.Errorf("policy hot reload is not supported with persistent core cache enabled; stop the core before saving")
+	}
+	// Native inbound dialers (Reality/ShadowTLS detours, TLS DNS resolvers)
+	// capture managers at construction and are not routed by policyRouter.
+	// Reject incomplete reloads rather than leaving them on retired resources.
+	for _, inbound := range applied.Inbounds {
+		if err := validateInboundPolicyReferences(c.ctx, inbound); err != nil {
+			return nil, err
+		}
+	}
+	for _, inbound := range options.Inbounds {
+		if err := validateInboundPolicyReferences(c.ctx, inbound); err != nil {
+			return nil, err
+		}
 	}
 	for _, inbound := range b.inbound.Inbounds() {
 		if inbound.Type() == "tun" {
@@ -125,6 +140,55 @@ func (c *Core) PreparePolicy(raw []byte) (*PolicyUpdate, error) {
 		update.impact.tags = changed
 	}
 	return update, nil
+}
+
+// validateInboundPolicyReferences detects native dialers that bypass the
+// stable policy entry. Keep such configurations running, but require an
+// explicit core stop before replacing the managers they captured.
+func validateInboundPolicyReferences(ctx context.Context, inbound option.Inbound) error {
+	raw, err := inbound.MarshalJSONContext(ctx)
+	if err != nil {
+		return err
+	}
+	var fields map[string]any
+	if err = json.Unmarshal(raw, &fields); err != nil {
+		return err
+	}
+	// The top-level listen detour references another inbound, not an outbound
+	// manager. Only nested handshake/dialer detours are policy references.
+	delete(fields, "detour")
+	var captured func(any) bool
+	captured = func(value any) bool {
+		switch value := value.(type) {
+		case map[string]any:
+			for key, field := range value {
+				if key == "detour" {
+					if tag, ok := field.(string); ok && tag != "" {
+						return true
+					}
+				}
+				if key == "domain_resolver" || key == "certificate_provider" {
+					if field != nil {
+						return true
+					}
+				}
+				if captured(field) {
+					return true
+				}
+			}
+		case []any:
+			for _, field := range value {
+				if captured(field) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	if captured(fields) {
+		return fmt.Errorf("policy hot reload is not supported with native inbound policy references on %q; stop the core before saving", inbound.Tag)
+	}
+	return nil
 }
 
 func policyBase(o option.Options) option.Options {

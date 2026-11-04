@@ -1,7 +1,9 @@
 package core
 
 import (
+	"errors"
 	"net"
+	"os"
 	"slices"
 
 	"github.com/alireza0/s-ui/logger"
@@ -29,13 +31,19 @@ func (c *Core) AddInbound(config []byte) error {
 	if err != nil {
 		return err
 	}
-	return box.inbound.Create(
+	err = box.inbound.Create(
 		ctx,
 		box.policy,
 		box.logFactory.NewLogger("inbound/"+inbound_config.Type+"["+inbound_config.Tag+"]"),
 		inbound_config.Tag,
 		inbound_config.Type,
 		inbound_config.Options)
+	if err == nil {
+		box.policy.mu.Lock()
+		box.applied.Inbounds = append(slices.Clone(box.applied.Inbounds), inbound_config)
+		box.policy.mu.Unlock()
+	}
+	return err
 }
 
 func (c *Core) RemoveInbound(tag string) error {
@@ -45,6 +53,11 @@ func (c *Core) RemoveInbound(tag string) error {
 	}
 	logger.Info("remove inbound: ", tag)
 	err = box.inbound.Remove(tag)
+	if err == nil || errors.Is(err, os.ErrInvalid) {
+		box.policy.mu.Lock()
+		box.applied.Inbounds = slices.DeleteFunc(slices.Clone(box.applied.Inbounds), func(inbound option.Inbound) bool { return inbound.Tag == tag })
+		box.policy.mu.Unlock()
+	}
 	// Listener shutdown alone does not close already routed connections.
 	// A missing listener can still have sessions left from an earlier edit.
 	if box.sessionTracker != nil {

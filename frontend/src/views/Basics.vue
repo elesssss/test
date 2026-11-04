@@ -630,9 +630,10 @@ const stateChange = computed(() => {
 
 const saveConfig = async () => {
   loading.value = true
-  const success = await Data().save("config", "set", appConfig.value)
-  if (success) {
-    oldConfig.value = JSON.parse(JSON.stringify(Data().config))
+  try {
+    const success = await Data().save("config", "set", appConfig.value)
+    if (success) oldConfig.value = JSON.parse(JSON.stringify(Data().config))
+  } finally {
     loading.value = false
   }
 }

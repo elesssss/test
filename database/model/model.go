@@ -52,6 +52,7 @@ type Client struct {
 	ResetDays  int   `json:"resetDays" form:"resetDays" gorm:"default:0;not null"`
 	NextReset  int64 `json:"nextReset" form:"nextReset" gorm:"default:0;not null"`
 	TotalUp    int64 `json:"totalUp" form:"totalUp" gorm:"default:0;not null"`
+	ResetUsage bool  `json:"resetUsage,omitempty" form:"resetUsage" gorm:"-"` // explicit command, never inferred from counters
 	TotalDown  int64 `json:"totalDown" form:"totalDown" gorm:"default:0;not null"`
 }
 

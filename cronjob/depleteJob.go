@@ -1,30 +1,16 @@
 package cronjob
 
 import (
-	"github.com/alireza0/s-ui/database"
 	"github.com/alireza0/s-ui/logger"
 	"github.com/alireza0/s-ui/service"
 )
 
-type DepleteJob struct {
-	service.ClientService
-	service.InboundService
-}
+type DepleteJob struct{ service.ConfigService }
 
-func NewDepleteJob() *DepleteJob {
-	return new(DepleteJob)
-}
+func NewDepleteJob() *DepleteJob { return new(DepleteJob) }
 
 func (s *DepleteJob) Run() {
-	inboundIds, err := s.ClientService.DepleteClients()
-	if err != nil {
-		logger.Warning("Disable depleted users failed: ", err)
-		return
-	}
-	if len(inboundIds) > 0 {
-		err := s.InboundService.UpdateInboundsUsers(database.GetDB(), inboundIds)
-		if err != nil {
-			logger.Error("unable to update inbound users: ", err)
-		}
+	if err := s.ConfigService.ReconcileDepletedClients(); err != nil {
+		logger.Error("unable to reconcile depleted users: ", err)
 	}
 }

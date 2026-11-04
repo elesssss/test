@@ -43,10 +43,12 @@ func (a *ApiService) LoadData(c *gin.Context) {
 func (a *ApiService) getData(c *gin.Context) (interface{}, error) {
 	data := make(map[string]interface{}, 0)
 	lu := c.Query("lu")
-	isUpdated, err := a.ConfigService.CheckChanges(lu)
+	revision, err := a.ConfigService.Revision()
 	if err != nil {
 		return "", err
 	}
+	isUpdated := lu != revision
+	data["revision"] = revision
 	onlines, err := a.StatsService.GetOnlines()
 
 	// Carried on every poll so the panel can keep saying the core is down on
@@ -393,11 +395,7 @@ func (a *ApiService) SetMaintenance(c *gin.Context) {
 }
 
 func (a *ApiService) ResetTraffic(c *gin.Context) {
-	if err := a.ClientService.ResetAllClientsTraffic(); err != nil {
-		jsonMsg(c, "resetTraffic", err)
-		return
-	}
-	err := a.ConfigService.RestartCore()
+	err := a.ConfigService.ResetTraffic()
 	jsonMsg(c, "resetTraffic", err)
 }
 

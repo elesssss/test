@@ -24,6 +24,7 @@ export interface Client {
   autoReset?: boolean
   resetDays?: number
   nextReset?: number
+  resetUsage?: boolean
   totalUp?: number
   totalDown?: number
   createdAt?: number

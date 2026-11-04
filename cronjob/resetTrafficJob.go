@@ -62,17 +62,9 @@ func (s *ResetTrafficJob) Run() {
 		return
 	}
 
-	if err = s.ClientService.ResetAllClientsTraffic(); err != nil {
+	if err = s.ConfigService.ResetTraffic(); err != nil {
 		logger.Warning("ResetTrafficJob: reset all clients failed: ", err)
 		return
-	}
-
-	// Restart before the bookkeeping write: clients are re-enabled in the
-	// database but the core still holds the old user list, and a failed write
-	// used to return early and leave them disconnected. The watchdog does not
-	// help -- it only starts a core that is not running.
-	if err = s.ConfigService.RestartCore(); err != nil {
-		logger.Error("ResetTrafficJob: unable to restart core: ", err)
 	}
 
 	// Advance to the next boundary. schedule.Next returns the nearest upcoming

@@ -23,7 +23,7 @@ ENV CC=gcc
 # Modules in their own layer, so a source-only change keeps them cached.
 COPY go.mod go.sum ./
 # The local replacement must exist before Go loads the module graph.
-COPY third_party/veepin/ ./third_party/veepin/
+COPY deps/veepin/ ./deps/veepin/
 RUN go mod download
 
 # libcronet ships inside the cronet-go lib module pinned in go.mod, so

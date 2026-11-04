@@ -2,7 +2,6 @@ package service
 
 import (
 	"encoding/json"
-	"os"
 
 	"github.com/alireza0/s-ui/database"
 	"github.com/alireza0/s-ui/database/model"
@@ -78,28 +77,6 @@ func (s *ServicesService) Save(tx *gorm.DB, act string, data json.RawMessage) er
 			}
 		}
 
-		if corePtr.IsRunning() {
-			configData, err := srv.MarshalJSON()
-			if err != nil {
-				return err
-			}
-			if act == "edit" {
-				var oldTag string
-				err = tx.Model(model.Service{}).Select("tag").Where("id = ?", srv.Id).Find(&oldTag).Error
-				if err != nil {
-					return err
-				}
-				err = corePtr.RemoveService(oldTag)
-				if err != nil && err != os.ErrInvalid {
-					return err
-				}
-			}
-			err = corePtr.AddService(configData)
-			if err != nil {
-				return err
-			}
-		}
-
 		err = tx.Save(&srv).Error
 		if err != nil {
 			return err
@@ -110,44 +87,12 @@ func (s *ServicesService) Save(tx *gorm.DB, act string, data json.RawMessage) er
 		if err != nil {
 			return err
 		}
-		if corePtr.IsRunning() {
-			err = corePtr.RemoveService(tag)
-			if err != nil && err != os.ErrInvalid {
-				return err
-			}
-		}
 		err = tx.Where("tag = ?", tag).Delete(model.Service{}).Error
 		if err != nil {
 			return err
 		}
 	default:
 		return common.NewErrorf("unknown action: %s", act)
-	}
-	return nil
-}
-
-func (s *ServicesService) RestartServices(tx *gorm.DB, ids []uint) error {
-	if !corePtr.IsRunning() {
-		return nil
-	}
-	var services []*model.Service
-	err := tx.Model(model.Service{}).Preload("Tls").Where("id in ?", ids).Find(&services).Error
-	if err != nil {
-		return err
-	}
-	for _, srv := range services {
-		err = corePtr.RemoveService(srv.Tag)
-		if err != nil && err != os.ErrInvalid {
-			return err
-		}
-		srvConfig, err := srv.MarshalJSON()
-		if err != nil {
-			return err
-		}
-		err = corePtr.AddService(srvConfig)
-		if err != nil {
-			return err
-		}
 	}
 	return nil
 }

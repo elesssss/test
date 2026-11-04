@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	latestReleaseURL = "https://api.github.com/repos/alireza0/s-ui/releases/latest"
+	latestReleaseURL = "https://api.github.com/repos/bryet/s-ui/releases/latest"
 	// GitHub allows 60 unauthenticated calls an hour per IP, shared with
 	// whatever else runs on the host; a release check needs nowhere near that.
 	updateCheckTTL = 6 * time.Hour
@@ -107,7 +107,7 @@ func fetchLatestRelease() (string, string, error) {
 	// The panel renders this URL as a link the operator is invited to
 	// click while logged in, and Vue's href binding does not filter
 	// schemes, so only the expected GitHub URL is handed on.
-	if !strings.HasPrefix(release.HtmlURL, "https://github.com/") {
+	if !strings.HasPrefix(release.HtmlURL, "https://github.com/bryet/s-ui/releases/") {
 		return "", "", common.NewError("release check: unexpected URL in the answer")
 	}
 	return release.TagName, release.HtmlURL, nil

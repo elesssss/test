@@ -2,6 +2,7 @@ package service
 
 import (
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -378,28 +379,16 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 		}
 		return objs, err
 	}
-	objs = []string{obj}
 	tx := database.GetDB().Begin()
 	if tx.Error != nil {
 		return nil, tx.Error
 	}
-	defer func() {
-		if r := recover(); r != nil {
-			tx.Rollback()
-			panic(r)
-		}
-		if err != nil {
-			tx.Rollback()
-			return
-		}
-		if err = tx.Commit().Error; err != nil {
-			return
-		}
-		LastUpdate.Store(time.Now().Unix())
-		if !corePtr.IsRunning() {
-			err = s.startCoreLocked(false)
-		}
-	}()
+	defer tx.Rollback()
+	before, err := s.snapshotRuntime(tx, obj)
+	if err != nil {
+		return nil, err
+	}
+	objs = []string{obj}
 
 	switch obj {
 	case "clients":
@@ -407,14 +396,10 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 		inboundIds, err = s.ClientService.Save(tx, act, data, hostname)
 		if err == nil && len(inboundIds) > 0 {
 			objs = append(objs, "inbounds")
-			err = s.InboundService.UpdateInboundsUsers(tx, inboundIds)
-			if err != nil {
-				return nil, common.NewErrorf("failed to update users for inbounds: %v", err)
-			}
 		}
 	case "tls":
 		err = s.TlsService.Save(tx, act, data, hostname)
-		objs = append(objs, "clients", "inbounds")
+		objs = append(objs, "clients", "inbounds", "services")
 	case "services":
 		err = s.ServicesService.Save(tx, act, data)
 	case "endpoints":
@@ -422,8 +407,6 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 	case "settings":
 		remarkPrefix := s.SettingService.SubRemarkPrefix(tx)
 		err = s.SettingService.Save(tx, data)
-		// Stored client links carry the remark prefix, so flipping it has to
-		// rebuild them, the way a TLS edit does.
 		if err == nil && s.SettingService.SubRemarkPrefix(tx) != remarkPrefix {
 			var inbounds []model.Inbound
 			err = tx.Model(model.Inbound{}).Preload("Tls").Find(&inbounds).Error
@@ -438,40 +421,42 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 	if err != nil {
 		return nil, err
 	}
-
-	dt := time.Now().Unix()
-	err = tx.Create(&model.Changes{
-		DateTime: dt,
-		Actor:    loginUser,
-		Key:      obj,
-		Action:   act,
-		Obj:      data,
-	}).Error
+	if err = tx.Create(&model.Changes{DateTime: time.Now().Unix(), Actor: loginUser, Key: obj, Action: act, Obj: data}).Error; err != nil {
+		return nil, err
+	}
+	after, err := s.snapshotRuntime(tx, obj)
 	if err != nil {
 		return nil, err
 	}
+	if err = applyRuntimeChanges(runtimeChanges(before, after), func() error { return tx.Commit().Error }); err != nil {
+		return nil, err
+	}
+	LastUpdate.Store(time.Now().Unix())
+	if !corePtr.IsRunning() {
+		err = s.startCoreLocked(false)
+	}
+	return objs, err
+}
 
-	return objs, nil
+var revisionEpoch = common.Random(16)
+
+// Revision is server-issued: browser clocks and second-level timestamps cannot
+// distinguish multiple commits in the same second. The epoch forces a refresh
+// after a process restart.
+func (s *ConfigService) Revision() (string, error) {
+	var revision uint64
+	if err := database.GetDB().Model(model.Changes{}).Select("COALESCE(MAX(id), 0)").Scan(&revision).Error; err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("r:%s:%d", revisionEpoch, revision), nil
 }
 
 func (s *ConfigService) CheckChanges(lu string) (bool, error) {
-	if lu == "" {
-		return true, nil
-	}
-	intLu, err := strconv.ParseInt(lu, 10, 64)
+	revision, err := s.Revision()
 	if err != nil {
 		return false, err
 	}
-	if LastUpdate.Load() == 0 {
-		db := database.GetDB()
-		var count int64
-		err := db.Model(model.Changes{}).Where("date_time > ?", intLu).Count(&count).Error
-		if err == nil {
-			LastUpdate.Store(time.Now().Unix())
-		}
-		return count > 0, err
-	}
-	return LastUpdate.Load() > intLu, nil
+	return lu != revision, nil
 }
 
 func (s *ConfigService) GetChanges(actor string, chngKey string, count string) []model.Changes {

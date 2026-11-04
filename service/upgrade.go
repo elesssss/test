@@ -7,6 +7,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -25,7 +27,7 @@ import (
 )
 
 const (
-	releaseDownloadURL = "https://github.com/alireza0/s-ui/releases/download/"
+	releaseDownloadURL = "https://github.com/bryet/s-ui/releases/download/"
 	// The unit install.sh writes. Upgrading in place only makes sense for the
 	// installation that unit runs; anything else was set up by hand.
 	systemdUnit = "s-ui.service"
@@ -149,7 +151,12 @@ func (s *UpdateService) upgradeTo(tag string) error {
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(stage)
+	keepStage := false
+	defer func() {
+		if !keepStage {
+			_ = os.RemoveAll(stage)
+		}
+	}()
 
 	archiveName := "s-ui-linux-" + arch + ".tar.gz"
 	base := releaseDownloadURL + tag + "/"
@@ -179,21 +186,30 @@ func (s *UpdateService) upgradeTo(tag string) error {
 		return err
 	}
 
-	// The running process keeps its own inode; the rename only changes what
-	// the next start executes.
-	if err := os.Rename(newBin, exe); err != nil {
+	// Preserve the unit and its Environment/ExecStart overrides. Replace only
+	// executable payloads, retaining backups until scheduling and migration finish.
+	replacements := []*updateReplacement{{source: newBin, destination: exe, mode: 0755}}
+	for _, name := range []string{"libcronet.so"} {
+		source := filepath.Join(stage, name)
+		if _, e := os.Stat(source); e == nil {
+			replacements = append(replacements, &updateReplacement{source: source, destination: filepath.Join(filepath.Dir(exe), name), mode: 0755})
+		} else if !os.IsNotExist(e) {
+			return e
+		}
+	}
+	if err = installUpdateFiles(stage, replacements); err != nil {
+		keepStage = true
+		return fmt.Errorf("update staging failed; recovery files retained in %s: %w", stage, err)
+	}
+	if err = scheduleUpdateRestart(exe, stage, replacements); err != nil {
+		if restoreErr := restoreUpdateFiles(replacements); restoreErr != nil {
+			keepStage = true
+			return errors.Join(err, fmt.Errorf("update rollback failed; backups retained in %s: %w", stage, restoreErr))
+		}
 		return err
 	}
-	// The same files install.sh refreshes. Neither is needed to come back up,
-	// so a failure is reported and the update goes on.
-	if err := replaceFile(filepath.Join(stage, "s-ui.sh"), "/usr/bin/s-ui", 0755); err != nil {
-		logger.Warning("update: unable to replace /usr/bin/s-ui:", err)
-	}
-	if err := replaceFile(filepath.Join(stage, systemdUnit), "/etc/systemd/system/"+systemdUnit, 0644); err != nil {
-		logger.Warning("update: unable to replace the systemd unit:", err)
-	}
-
-	return scheduleRestart(exe)
+	keepStage = true // the transient unit owns cleanup after successful startup
+	return nil
 }
 
 func downloadText(url string) (string, error) {
@@ -249,9 +265,8 @@ func checksumFor(sums, name string) string {
 	return ""
 }
 
-// extractRelease takes the three files a release ships from its s-ui/
-// directory and ignores everything else, so no entry name can reach a path
-// outside dst.
+// extractRelease reads executable payloads only. Unit/menu files are not
+// replaced from the panel, so local service configuration stays intact.
 func extractRelease(archive, dst string) error {
 	f, err := os.Open(archive)
 	if err != nil {
@@ -264,7 +279,7 @@ func extractRelease(archive, dst string) error {
 	}
 	defer gz.Close()
 
-	wanted := map[string]os.FileMode{"sui": 0755, "s-ui.sh": 0755, systemdUnit: 0644}
+	wanted := map[string]os.FileMode{"sui": 0755, "libcronet.so": 0755}
 	found := make(map[string]bool)
 	tr := tar.NewReader(gz)
 	for {
@@ -283,7 +298,10 @@ func extractRelease(archive, dst string) error {
 		if dir != "s-ui/" || !ok {
 			continue
 		}
-		out, err := os.OpenFile(filepath.Join(dst, name), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+		if found[name] {
+			return common.NewError("duplicate release entry: ", name)
+		}
+		out, err := os.OpenFile(filepath.Join(dst, name), os.O_CREATE|os.O_WRONLY|os.O_EXCL, mode)
 		if err != nil {
 			return err
 		}
@@ -314,46 +332,5 @@ func checkBinary(bin, version string) error {
 	if !strings.Contains(string(out), version) {
 		return common.NewError("the new binary reports an unexpected version")
 	}
-	return nil
-}
-
-// replaceFile swaps src in for dst through a rename beside dst, so a reader
-// never sees half a file.
-func replaceFile(src, dst string, mode os.FileMode) error {
-	data, err := os.ReadFile(src)
-	if err != nil {
-		return err
-	}
-	tmp := dst + ".new"
-	if err := os.WriteFile(tmp, data, mode); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, dst); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	return nil
-}
-
-// scheduleRestart stops the service, migrates the database with the new
-// binary and starts it again, from a transient unit: a child of this process
-// would be killed with the rest of the service's cgroup on the stop. The pause
-// lets the answer to this request reach the panel first.
-func scheduleRestart(exe string) error {
-	script := "sleep 2; systemctl daemon-reload; systemctl stop s-ui; '" + exe + "' migrate; systemctl start s-ui"
-	args := []string{
-		"--no-block", "--collect",
-		"--unit", "s-ui-update-" + time.Now().Format("20060102150405"),
-		"--description", "s-ui panel update",
-	}
-	if dbFolder, ok := os.LookupEnv("SUI_DB_FOLDER"); ok {
-		args = append(args, "--setenv", "SUI_DB_FOLDER="+dbFolder)
-	}
-	args = append(args, "/bin/sh", "-c", script)
-	out, err := exec.Command("systemd-run", args...).CombinedOutput()
-	if err != nil {
-		return common.NewError("unable to schedule the restart: ", err, " ", strings.TrimSpace(string(out)))
-	}
-	logger.Info("update installed, restarting the panel")
 	return nil
 }

@@ -3,7 +3,7 @@ module github.com/alireza0/s-ui
 go 1.27.3
 
 // Keep the pinned L2TP implementation reproducible with the iKuai IKEv1 fixes.
-replace github.com/wanan9999/veepin => ./third_party/veepin
+replace github.com/wanan9999/veepin => ./deps/veepin
 
 require (
 	github.com/anytls/sing-anytls v0.0.13

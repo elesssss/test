@@ -585,6 +585,7 @@ export default {
       shuffleConfigs(this.clientConfig, k)
     },
     resetUsage(){
+      this.client.resetUsage = true
       this.client.totalUp = (this.client.totalUp ?? 0) + this.client.up
       this.client.totalDown = (this.client.totalDown ?? 0) + this.client.down
       this.client.up = 0

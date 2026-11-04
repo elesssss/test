@@ -8,7 +8,7 @@
 - 原模块校验和：`h1:WpWkpamXTWo/LuLd8lM0oWY2GQJOEzbo8UmvIiGBZtM=`
 - 许可证：MIT，原始声明保留在 `LICENSE`。
 
-本目录仅保留 S-UI 使用的 `l2tp` 包、其递归依赖和对应 Go 测试/README，不是完整的 veepin 产品分支。测试代码额外引用的 `ikev2` 依赖也保留。主模块通过 `replace github.com/wanan9999/veepin => ./third_party/veepin` 使用这里的源码，原始依赖版本不变。Dockerfile 必须在读取模块图前复制本目录。
+本目录仅保留 S-UI 使用的 `l2tp` 包、其递归依赖和对应 Go 测试/README，不是完整的 veepin 产品分支。测试代码额外引用的 `ikev2` 依赖也保留。主模块通过 `replace github.com/wanan9999/veepin => ./deps/veepin` 使用这里的源码，原始依赖版本不变。Dockerfile 必须在读取模块图前复制本目录。
 
 ## 补丁
 
@@ -27,7 +27,7 @@
 本目录是独立 Go 模块，主模块的 `go test ./...` 不会遍历本目录。须单独执行：
 
 ```sh
-cd third_party/veepin
+cd deps/veepin
 go test ./internal/cryptoutil ./internal/ikev1 ./internal/l2tp ./l2tp
 go test -run 'TestIKuai|TestMODP3072' ./internal/cryptoutil ./internal/ikev1
 ```
