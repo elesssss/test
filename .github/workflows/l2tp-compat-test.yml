@@ -43,3 +43,7 @@ jobs:
         run: go test -mod=readonly -race -count=3 ./internal/l2tp ./internal/ikev2/esp ./internal/ppp
       - name: Check concurrent userspace stacks and routing identity
         run: go test -mod=readonly -race -tags with_gvisor -count=3 ./core/protocol/l2tp
+      - name: Check real local ICMP socket forwarding
+        env:
+          SUI_L2TP_ICMP_INTEGRATION: '1'
+        run: go test -mod=readonly -tags with_gvisor -count=1 -run TestSessionStackICMPRealPingPort ./core/protocol/l2tp

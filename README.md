@@ -10,7 +10,7 @@
 4. 放行 UDP **500** 和 **4500** 端口，无需对公网开放 UDP 1701。服务端无需安装 strongSwan、xl2tpd 或 pppd，也不依赖 `/dev/net/tun`、主机 NAT 或转发规则。
 5. 在操作系统或路由器的 VPN 客户端中手动填写公网 IPv4 地址、PSK、用户名和密码。L2TP 不包含在 sing-box 和 Clash 订阅中。
 
-每个通过认证的会话都会携带用户身份，经由 sing-box 转发 IPv4 TCP/UDP 流量，因此现有流量限制和 `auth_user` 路由规则同样适用。目前不支持 ICMP 和 IPv6 转发。请在客户端配置中阻止隧道外的流量，包括 IPv6 流量。
+每个通过认证的会话都会携带用户身份，经由 sing-box 转发 IPv4 TCP/UDP 流量，因此现有流量限制和 `auth_user` 路由规则同样适用。IPv4 ICMP Echo（ping）也会按 PPP 用户身份匹配路由，通过 `direct` 等提供 ICMP Socket 转发的出站发送真实请求；仅支持 TCP/UDP 的代理出站不会转发 ICMP，也不会本地伪造成功回包。目前不支持固定地址的隧道出站 ICMP 转发和 IPv6 转发。ICMP 使用独立流路径，不进入面板现有 TCP/UDP 会话流量计数。请在客户端配置中阻止隧道外的流量，包括 IPv6 流量。
 
 如需使用面板中的 DNS 配置，请配置 DNS 服务器，并在常规路由规则之前添加一条针对目标端口 53 的 `hijack-dns` 规则。DNS 服务器列表为空时，sing-box 仍可使用隐式的系统 DNS；DNS 劫持无法控制隧道外的流量或客户端的 DoH 请求。
 

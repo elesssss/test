@@ -111,9 +111,11 @@ func (i *Inbound) CloseUserSessions(keep map[string]struct{}) int {
 // One handler and stack per authenticated PPP session prevents address reuse
 // from inheriting a previous user's connections or routing identity.
 type sessionHandler struct {
-	inbound *Inbound
-	user    string
-	address netip.Addr
+	inbound   *Inbound
+	user      string
+	address   netip.Addr
+	icmpMu    sync.Mutex
+	icmpPorts map[tun.Port]*sessionICMPPort
 }
 
 func (h *sessionHandler) metadata(network string, source, destination M.Socksaddr) adapter.InboundContext {
@@ -128,6 +130,9 @@ func (h *sessionHandler) JudgeFlow(network uint8, source, destination netip.Addr
 	// A packet-level bypass would skip the panel's tracking and quota hooks.
 	if network == 6 || network == 17 {
 		return tun.FlowVerdict{Action: tun.ActionAccept}
+	}
+	if network == 1 {
+		return h.judgeICMP(source, destination, firstPacket)
 	}
 	return tun.FlowVerdict{Action: tun.ActionReject}
 }
