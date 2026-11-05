@@ -4,12 +4,14 @@ on:
   push:
     paths:
       - 'deps/veepin/**'
+      - 'core/protocol/l2tp/**'
       - 'go.mod'
       - 'go.sum'
       - '.github/workflows/l2tp-compat-test.yml'
   pull_request:
     paths:
       - 'deps/veepin/**'
+      - 'core/protocol/l2tp/**'
       - 'go.mod'
       - 'go.sum'
       - '.github/workflows/l2tp-compat-test.yml'
@@ -29,10 +31,15 @@ jobs:
           cache-dependency-path: deps/veepin/go.sum
       - name: Check patch formatting
         run: |
-          test -z "$(gofmt -l deps/veepin/internal/ikev1/ikuai*.go deps/veepin/internal/ikev1/diagnostics*.go deps/veepin/l2tp/server_udp_linux_test.go deps/veepin/internal/cryptoutil/modp3072_test.go)"
+          test -z "$(gofmt -l deps/veepin/internal/l2tp/*.go core/protocol/l2tp/*.go deps/veepin/internal/ikev1/ikuai*.go deps/veepin/internal/ikev1/diagnostics*.go deps/veepin/l2tp/server_udp_linux_test.go deps/veepin/internal/cryptoutil/modp3072_test.go)"
       - name: Test L2TP dependency
         working-directory: deps/veepin
-        run: go test -mod=readonly -count=1 ./internal/cryptoutil ./internal/ikev1 ./internal/l2tp ./l2tp
+        run: go test -mod=readonly -count=1 ./internal/cryptoutil ./internal/ikev1 ./internal/ikev2/esp ./internal/ppp ./internal/l2tp ./l2tp
       - name: Check compatibility changes for races
         working-directory: deps/veepin
-        run: go test -mod=readonly -race -count=1 -run 'TestIKuai|TestMODP3072|TestRetransmitDiagnostics|TestInitialSendError|TestTimeoutWithoutSendError|TestIKESendFailure|TestTunnelSourceNATDiagnostic|TestServerWildcard|TestIKERepliesFollowObservedTransport' ./internal/cryptoutil ./internal/ikev1 ./internal/l2tp ./l2tp
+        run: go test -mod=readonly -race -count=1 -run 'TestIKuai|TestMODP3072|TestRetransmitDiagnostics|TestInitialSendError|TestTimeoutWithoutSendError|TestServerWildcard' ./internal/cryptoutil ./internal/ikev1 ./l2tp
+      - name: Check all L2TP sessions and ESP directions for races
+        working-directory: deps/veepin
+        run: go test -mod=readonly -race -count=3 ./internal/l2tp ./internal/ikev2/esp ./internal/ppp
+      - name: Check concurrent userspace stacks and routing identity
+        run: go test -mod=readonly -race -tags with_gvisor -count=3 ./core/protocol/l2tp

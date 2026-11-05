@@ -2,6 +2,7 @@ package l2tp
 
 import (
 	"context"
+	"encoding/binary"
 	"io"
 	"net"
 	"testing"
@@ -128,15 +129,15 @@ func runClientServerLoopback(t *testing.T, shape int) {
 	serverTUN.in <- down
 	assertPacket(t, "server->client", clientTUN.out, down)
 	server.mu.Lock()
-	var peer *serverPeer
-	for _, candidate := range server.byCookie {
-		peer = candidate
-		break
-	}
+	peer := server.byCookie[client.ike.Cookie()]
+	call := server.byIP[binary.BigEndian.Uint32(nc.AssignedIP.To4())]
 	server.mu.Unlock()
-	peer.mu.Lock()
-	originalPPP := peer.ppp
-	peer.mu.Unlock()
+	if peer == nil || call == nil {
+		t.Fatal("missing crypto peer or independent PPP call")
+	}
+	call.mu.Lock()
+	originalPPP := call.ppp
+	call.mu.Unlock()
 	for n := range 6 {
 		peer.mu.Lock()
 		oldSPI := peer.inSPI
@@ -154,8 +155,10 @@ func runClientServerLoopback(t *testing.T, shape int) {
 		for {
 			peer.mu.Lock()
 			changed := peer.inSPI != oldSPI
-			samePPP := peer.ppp == originalPPP
 			peer.mu.Unlock()
+			call.mu.Lock()
+			samePPP := call.ppp == originalPPP
+			call.mu.Unlock()
 			if !samePPP {
 				t.Fatal("rekey replaced PPP session")
 			}

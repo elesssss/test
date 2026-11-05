@@ -44,8 +44,45 @@ Control vs data is demuxed by the header **T-bit**.
 
 - **Client (LAC)** — `NewClient(conn, tun, ClientConfig) *Client`; `RoleLAC`.
 - **Server (LNS)** — `NewServer(rawIKE, rawNATT, tun, ServerConfig) *Server`.
-- **Tunnel engine** — `NewTunnel(role, send, handler) *Tunnel`; `Role`, `Handler`,
-  `NetConfig` (assigned addressing).
+- **Tunnel engine** — `NewTunnel(role, send, handler) *Tunnel` keeps the single-call
+  client API; `NewServerTunnel(send, callHandler)` accepts independent server
+  calls with `SendCallPPP`/`CloseCall`. `NetConfig` supplies client addressing.
+
+## Concurrent server users
+
+One listener demultiplexes three independent ownership layers:
+
+- An IKE crypto peer owns cookie aliases and overlapping ESP SAs, not a PPP user.
+- A control tunnel owns a globally unique local Tunnel ID and one reliable Ns/Nr
+  sequence. Initial SCCRQ deduplication is scoped to the crypto peer, authenticated
+  endpoint identity, inner UDP ports and peer Tunnel ID. Different logins from one
+  router may reuse identities, NAT endpoints and peer IDs without being merged.
+- Each Session ID owns its PPP authentication, allocated IPv4 address, negotiated
+  MRU, packet device and routing username. Several calls can share a tunnel/SA;
+  several tunnels can also share one SA. CDN, PPP failure and `KickUserSessions`
+  stop only the affected calls, not their siblings or the shared crypto carrier.
+
+Quick Mode and registered IKE renewals update only carriers already associated
+with that crypto peer. An independently established matching Main Mode SA is not
+assumed to be a renewal: it must send authenticated traffic addressed to the
+existing tunnel before it can carry that tunnel. Late traffic on older overlapping
+SAs does not roll back the preferred carrier. PPP users, IPs and devices survive
+key changes. Removing the final carrier tears down the tunnel; an idle crypto peer
+is reaped after its last tunnel is gone.
+
+Call IDs and IPs remain quarantined during the 31-second close retry period. A
+peer Session ID may be used for a new call once its old CDN is acknowledged;
+local IDs and addresses remain separate. Closing tunnel tombstones likewise do
+not swallow a new SCCRQ, and late cleanup cannot remove the new tunnel's index.
+
+Regression coverage includes real loopback IKE/ESP/PPP for three same-identity
+accounts on one listener, authentication failure, one-user kick, immediate redial
+and concurrent Quick Mode/Main Mode renewals. Shared-control tests perform two
+independent PPP authentications, source admission and CDN/redial cleanup; a
+synthetic 254-call test checks address ownership, not network throughput. The
+panel stack test runs TCP/UDP users simultaneously with independent identity/MRU.
+These model same-router/iKuai scenarios; no physical iKuai device or 24-hour soak
+has been certified by these tests.
 
 ## Implementation notes & caveats
 

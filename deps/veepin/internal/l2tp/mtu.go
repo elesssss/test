@@ -11,12 +11,16 @@ import (
 // userspace device. DF packets get the existing PMTU response; other IPv4
 // packets are fragmented with copied options and offsets per RFC 791.
 func sendIPv4(t *Tunnel, packet []byte, mtu, pad int, feedback func([]byte)) error {
+	return sendIPv4Through(t, packet, mtu, pad, feedback)
+}
+
+func sendIPv4Through(sender ppp.Transport, packet []byte, mtu, pad int, feedback func([]byte)) error {
 	packet = dataplane.TrimToIP(packet)
 	if len(packet) < 20 || packet[0]>>4 != 4 || mtu < 68 {
 		return nil
 	}
 	if len(packet) <= mtu {
-		return t.SendPPP(ppp.EncapsulateIPPadded(packet, min(pad, mtu)))
+		return sender.SendPPP(ppp.EncapsulateIPPadded(packet, min(pad, mtu)))
 	}
 	if dataplane.NeedsFragmentation(packet, mtu) {
 		if reply := dataplane.FragNeeded(packet, mtu); reply != nil {
@@ -84,7 +88,7 @@ func sendIPv4(t *Tunnel, packet []byte, mtu, pad int, feedback func([]byte)) err
 		}
 		binary.BigEndian.PutUint16(fragment[10:], ^uint16(sum))
 		copy(fragment[headerLen:], packet[ihl+offset:ihl+offset+size])
-		if err := t.SendPPP(ppp.EncapsulateIP(fragment)); err != nil {
+		if err := sender.SendPPP(ppp.EncapsulateIP(fragment)); err != nil {
 			return err
 		}
 		offset += size

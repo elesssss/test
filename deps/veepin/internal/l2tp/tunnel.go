@@ -67,11 +67,10 @@ type pending struct {
 	avps      []byte
 }
 
-// Tunnel is one L2TP control connection carrying a single session, driving a PPP
-// link over it. It is transport-neutral: it emits datagrams through send and is
-// fed inbound datagrams via HandleInbound. The control channel (Ns/Nr, retransmit)
-// is serialised under mu; the data path reads the peer IDs lock-free once the
-// session is up.
+// Tunnel is one transport-neutral L2TP control connection. NewTunnel retains
+// the single-call client API; NewServerTunnel demultiplexes independent PPP
+// calls. Ns/Nr and all calls share one reliable control sequence under mu.
+// The single-call data path reads its fixed peer IDs without that lock.
 type Tunnel struct {
 	requireSequence bool
 	role            Role
@@ -97,12 +96,16 @@ type Tunnel struct {
 	localTunnelID  uint16
 	localSessionID uint16
 
-	ns, nr          uint16
-	unacked         []pending
-	timer           *time.Timer
-	timerGeneration uint64
-	retries         int
-	closeErr        error
+	ns, nr                uint16
+	unacked               []pending
+	timer                 *time.Timer
+	timerGeneration       uint64
+	retries               int
+	closeErr              error
+	callHandler           CallHandler
+	calls                 map[uint16]*tunnelCall
+	callEvents            []callEvent
+	callEventsDispatching bool
 
 	// helloNs is the sequence number of the HELLO a probe is waiting on, and
 	// helloWait the channel closed when the peer acknowledges it (or the
@@ -179,6 +182,10 @@ func (t *Tunnel) HandleInbound(pkt []byte) {
 		return
 	}
 	if !h.isControl {
+		if t.callHandler != nil {
+			t.acceptCallData(h)
+			return
+		}
 		t.mu.Lock()
 		valid := t.state == stateEstablished && h.tunnelID == t.localTunnelID && h.sessionID == t.localSessionID
 		t.mu.Unlock()
@@ -276,7 +283,7 @@ func (t *Tunnel) handleControl(h header) {
 	}
 	// A Zero-Length Body message consumes no receive sequence number.
 	if len(avps) == 0 {
-		if h.sessionID != 0 && h.sessionID != t.localSessionID {
+		if t.callHandler == nil && h.sessionID != 0 && h.sessionID != t.localSessionID || t.callHandler != nil && h.sessionID != 0 && t.calls[h.sessionID] == nil {
 			t.mu.Unlock()
 			return
 		}
@@ -290,7 +297,7 @@ func (t *Tunnel) handleControl(h header) {
 		return
 	}
 	sessionMessage := mt == msgICRP || mt == msgICCN || mt == msgCDN || mt == 16
-	if sessionMessage && h.sessionID != t.localSessionID || !sessionMessage && h.sessionID != 0 {
+	if sessionMessage && ((t.callHandler == nil && h.sessionID != t.localSessionID) || (t.callHandler != nil && t.calls[h.sessionID] == nil)) || !sessionMessage && h.sessionID != 0 {
 		t.mu.Unlock()
 		return
 	}
@@ -317,7 +324,14 @@ func (t *Tunnel) handleControl(h header) {
 		t.sendStop(2, 8)
 		closed, cerr = true, err
 	} else {
-		up, closed, cerr = t.dispatch(avps)
+		if t.callHandler != nil && (mt == msgICRQ || mt == msgICCN || mt == msgCDN || mt == 16) {
+			if err := t.dispatchServerCalls(mt, h, avps); err != nil {
+				t.sendStop(2, 8)
+				closed, cerr = true, err
+			}
+		} else {
+			up, closed, cerr = t.dispatch(avps)
+		}
 	}
 	// If dispatch queued no control message, the peer's message is still
 	// unacknowledged; send a bare ZLB ack.
@@ -325,6 +339,9 @@ func (t *Tunnel) handleControl(h header) {
 		t.sendZLB()
 	}
 	t.mu.Unlock()
+	if t.callHandler != nil {
+		t.deliverCallEvents()
+	}
 
 	// Invoke handler callbacks outside the lock: SessionUp starts PPP, which
 	// re-enters SendPPP (which does not take mu, but keeping callbacks lock-free
@@ -396,7 +413,11 @@ func (t *Tunnel) dispatchLNS(mt uint16, avps []avp) (up, closed bool, cerr error
 		t.sendSCCRP()
 		t.state = stateWaitSCCCN
 	case mt == msgSCCCN && t.state == stateWaitSCCCN:
-		t.state = stateWaitICRQ
+		if t.callHandler != nil {
+			t.state = stateEstablished
+		} else {
+			t.state = stateWaitICRQ
+		}
 	case mt == msgICRQ && t.state == stateWaitICRQ:
 		sid, ok := findUint16(avps, avpAssignedSessionID)
 		if !ok || sid == 0 {
@@ -663,7 +684,11 @@ func (t *Tunnel) finishClose(err error) {
 		t.helloWait = nil
 	}
 	t.mu.Unlock()
-	t.h.Closed(err)
+	if t.callHandler != nil {
+		t.callHandler.Closed(err)
+	} else {
+		t.h.Closed(err)
+	}
 }
 
 // seqLess reports whether sequence a precedes b in the 16-bit wrapping space.

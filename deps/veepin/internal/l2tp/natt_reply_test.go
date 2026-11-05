@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/wanan9999/veepin/dataplane"
+	"github.com/wanan9999/veepin/internal/ikev1"
 	"github.com/wanan9999/veepin/internal/ikev2/esp"
 )
 
@@ -123,12 +124,12 @@ func TestUnverifiedIKECannotMoveExistingPeer(t *testing.T) {
 	pkt[17], pkt[18] = 0x10, 5
 	binary.BigEndian.PutUint32(pkt[24:], uint32(len(pkt)))
 	srv.dispatchIKE(pkt, forged, true)
-	if p.ikeNATT || p.addr != original || !p.nattAddr.IP.Equal(original.IP) {
+	if p.ikeNATT || p.addr.String() != original.String() || !p.nattAddr.IP.Equal(original.IP) {
 		t.Fatal("unverified IKE changed the peer's transport or address")
 	}
 	p.noteIKEAddr(original, true) // model a successful authenticated float.
 	srv.dispatchIKE(pkt, forged, false)
-	if !p.ikeNATT || p.addr != original || p.nattAddr != original {
+	if !p.ikeNATT || p.addr.String() != original.String() || p.nattAddr.String() != original.String() {
 		t.Fatal("old UDP/500 traffic changed the floated endpoint")
 	}
 }
@@ -143,8 +144,12 @@ func TestESPRebindingRequiresIntegrityAndFreshSequence(t *testing.T) {
 		EncKey: bytes.Repeat([]byte{0x11}, 16), IntegKey: bytes.Repeat([]byte{0x22}, 20)}
 	sender := &esp.SA{SPIOut: 0x12345678, Out: tr, In: tr}
 	receiver := &esp.SA{SPIIn: 0x12345678, Out: tr, In: tr}
-	p := &serverPeer{srv: &Server{}, nattAddr: original, sa: receiver,
-		tunnel: NewTunnel(RoleLNS, func([]byte) error { return nil }, newEndpoint(RoleLNS))}
+	policy := ikev1.TransportPolicy{LocalIP: net.IPv4(192, 0, 2, 2), PeerIP: net.IPv4(192, 0, 2, 1), LocalPort: 1701, PeerPort: 1701}
+	identity, err := makePeerIdentity([]byte{1, 0, 0, 0, 192, 0, 2, 1}, policy, original.IP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &serverPeer{srv: &Server{}, nattAddr: original, identity: identity, sa: receiver, sas: map[uint32]timedSA{0x12345678: {sa: receiver, expires: time.Now().Add(time.Hour), transport: policy}}}
 	packet, err := sender.Encapsulate(wrapUDP([]byte{0}, l2tpUDPPort, l2tpUDPPort), ipProtoUDP)
 	if err != nil {
 		t.Fatal(err)
@@ -152,15 +157,15 @@ func TestESPRebindingRequiresIntegrityAndFreshSequence(t *testing.T) {
 	tampered := append([]byte(nil), packet...)
 	tampered[len(tampered)-1] ^= 1
 	p.handleESP(tampered, forged)
-	if p.nattAddr != original {
+	if p.nattAddr.String() != original.String() {
 		t.Fatal("forged ESP moved the endpoint")
 	}
 	p.handleESP(packet, rebound)
-	if p.nattAddr != rebound {
+	if p.nattAddr.String() != rebound.String() {
 		t.Fatal("authenticated ESP did not move the endpoint")
 	}
 	p.handleESP(packet, forged)
-	if p.nattAddr != rebound {
+	if p.nattAddr.String() != rebound.String() {
 		t.Fatal("replayed ESP moved the endpoint")
 	}
 }

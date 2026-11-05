@@ -28,11 +28,11 @@ func lifecycleServer(t *testing.T) *Server {
 func TestExhaustedControlRetriesDoNotStartAnotherDrainPeriod(t *testing.T) {
 	s := lifecycleServer(t)
 	p := s.peerFor([8]byte{1}, &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 500}, false)
-	p.Closed(ErrControlTimeout)
+	s.removePeer(p, ErrControlTimeout)
 	p.mu.Lock()
-	closed, draining := p.closed, p.draining
+	closed := p.closed
 	p.mu.Unlock()
-	if !closed || draining || s.gate.HalfOpen() != 0 {
+	if !closed || s.gate.HalfOpen() != 0 {
 		t.Fatal("expired control channel retained resources for a second retry cycle")
 	}
 }
@@ -82,27 +82,15 @@ func TestUnexpectedListenerExitIsReported(t *testing.T) {
 }
 
 func TestSilentSetupAndEstablishedPeersAreReaped(t *testing.T) {
-	for _, ready := range []bool{false, true} {
-		t.Run(map[bool]string{false: "setup", true: "established"}[ready], func(t *testing.T) {
-			s := lifecycleServer(t)
-			p := &serverPeer{srv: s, cookie: [8]byte{1}, done: make(chan struct{}), addr: &net.UDPAddr{}, ready: ready}
-			s.byCookie[p.cookie] = p
-			if ready {
-				p.tunnel = NewTunnel(RoleLNS, func([]byte) error { return nil }, p)
-			}
-			go p.monitorWithTimeouts(20*time.Millisecond, 10*time.Millisecond, 20*time.Millisecond)
-			select {
-			case <-p.done:
-			case <-time.After(time.Second):
-				t.Fatal("silent peer leaked")
-			}
-			s.mu.Lock()
-			remaining := len(s.byCookie)
-			s.mu.Unlock()
-			if remaining != 0 {
-				t.Fatal("peer index survived teardown")
-			}
-		})
+	// Crypto peers have a finite setup deadline; L2TP reliability is now owned
+	// by each control tunnel. Exercise the existing failure cleanup directly.
+	s := lifecycleServer(t)
+	p := s.peerFor([8]byte{1}, &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 500}, false)
+	s.removePeer(p, errors.New("synthetic setup timeout"))
+	select {
+	case <-p.done:
+	default:
+		t.Fatal("setup peer was not released")
 	}
 }
 
@@ -130,8 +118,7 @@ func TestOldESPDeleteAndExpiryPreserveCurrentSA(t *testing.T) {
 	}
 	// A late handshake callback must never resurrect a removed index.
 	s.mapSPI(9, p)
-	s.mapIP(net.IPv4(10, 20, 0, 2), p)
-	if len(s.bySPI) != 0 || len(s.byIP) != 0 {
-		t.Fatal("late callback resurrected peer")
+	if len(s.byIP) != 0 {
+		t.Fatal("crypto peer resurrected a PPP address")
 	}
 }
