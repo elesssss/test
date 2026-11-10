@@ -1,3 +1,5 @@
+# 示例密码仅为占位符，部署前为每个目标换成独立的高强度随机密码。
+# 客户端与服务端对应目标的密码必须一致；不要使用安装脚本的公开默认密码。
 log_level: "info"   # info / warn / error / debug
 
 tunnels:         # 支持多组转发
@@ -6,24 +8,24 @@ tunnels:         # 支持多组转发
     remotes:                   # 出口服务器地址列表（每个条目有独立密码，对应不同目标地址）
       - addr: "your-vps.com:1018"       # 隧道出口地址
         password: "password-for-target1" # 与隧道出口某个目标地址的密码匹配（决定转发目标）
-    sni: "bing.com"            # TLS 伪装域名
-    insecure: true             # 自签证书请保留；Let's Encrypt 请注释
+    sni: "your-vps.com"        # 必须与隧道出口证书的域名一致
+    insecure: false            # 推荐验证证书；仅自签测试环境显式设 true
 
   # ── 隧道入口 2：同隧道出口、不同密码 → 路由到 target2 ──
   - listen: "[::]:2018"
     remotes:
       - addr: "your-vps.com:1018"
         password: "password-for-target2"
-    sni: "bing.com"
-    insecure: true
+    sni: "your-vps.com"
+    insecure: false
 
   # ── 隧道入口 3：同隧道出口、不同密码 → 路由到 target3 ──
   - listen: "[::]:2019"
     remotes:
       - addr: "your-vps.com:1018"
         password: "password-for-target3"
-    sni: "bing.com"
-    insecure: true
+    sni: "your-vps.com"
+    insecure: false
 
   # ── 隧道出口：端口复用，根据隧道入口密码匹配不同目标地址 ──
   - listen: "[::]:1018"
@@ -34,6 +36,6 @@ tunnels:         # 支持多组转发
         password: "password-for-target2"
       - addr: "your-target3.com:1019"   # 目标地址 3
         password: "password-for-target3"
-    sni: "bing.com"            # TLS 伪装域名
+    sni: "your-vps.com"        # 服务端使用 cert/key；该字段不选择后端
     cert: "/path/to/server.crt" # 证书路径（自签 or Let's Encrypt）
     key:  "/path/to/server.key" # 私钥路径（自签 or Let's Encrypt）

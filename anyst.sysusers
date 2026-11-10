@@ -1,0 +1,2 @@
+# Install as /usr/lib/sysusers.d/anyst.conf, then run systemd-sysusers.
+u anyst - "Anyst tunnel service" /var/anyst /usr/sbin/nologin

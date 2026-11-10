@@ -6,12 +6,12 @@ description = "A port tunnel with TCP (AnyTLS-like) and UDP (TUIC-like) support 
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-tokio-rustls = "0.26"
-rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2"
-quinn = "0.11"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "bloom"] }
 serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
+serde_yaml = { package = "serde_yaml_ng", version = "=0.10.0" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
@@ -19,7 +19,7 @@ clap = { version = "4", features = ["derive"] }
 bytes = "1"
 anyhow = "1"
 rustls-native-certs = "0.8"
-openssl = { version = "0.10", features = ["vendored"] }
 sha2 = "0.10"
+subtle = "2"
 md-5 = "0.10"
 rand = "0.8"

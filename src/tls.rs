@@ -10,8 +10,8 @@ pub fn load_certs(path: &str) -> anyhow::Result<Vec<CertificateDer<'static>>> {
         .with_context(|| format!("failed to open cert file: {}", path))?;
     let mut reader = BufReader::new(file);
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
-        .filter_map(|r| r.ok())
-        .collect();
+        .collect::<Result<_, _>>()
+        .with_context(|| format!("failed to parse cert file: {}", path))?;
     if certs.is_empty() {
         anyhow::bail!("no certificates found in {}", path);
     }
@@ -54,9 +54,9 @@ pub fn build_rustls_server_config(
 
 /// Build a `rustls::ClientConfig`.
 ///
-/// When `insecure` is true, skip certificate verification (for self-signed or
-/// Let's Encrypt certs behind a custom SNI).
-pub fn build_rustls_client_config(insecure: bool) -> rustls::ClientConfig {
+/// `insecure` skips chain/hostname checks, but still verifies the handshake
+/// signature. Prefer trusted certificates with a matching server name.
+pub fn build_rustls_client_config(insecure: bool) -> anyhow::Result<rustls::ClientConfig> {
     let builder = rustls::ClientConfig::builder();
     let mut config = if insecure {
         builder
@@ -67,17 +67,20 @@ pub fn build_rustls_client_config(insecure: bool) -> rustls::ClientConfig {
         let mut root_store = rustls::RootCertStore::empty();
         let native = rustls_native_certs::load_native_certs();
         for cert in native.certs {
-            let _ = root_store.add(cert);
+            if let Err(e) = root_store.add(cert) {
+                tracing::warn!("skipping invalid system trust root: {e}");
+            }
         }
-        for _err in native.errors {
-            // silently skip certificates that failed to load
+        for err in native.errors {
+            tracing::warn!("failed to load system trust roots: {err}");
         }
+        anyhow::ensure!(!root_store.is_empty(), "no usable system trust roots");
         builder
             .with_root_certificates(root_store)
             .with_no_client_auth()
     };
     config.alpn_protocols = vec![b"anyst-01".to_vec()];
-    config
+    Ok(config)
 }
 
 /// Build a `quinn::ServerConfig` for QUIC (UDP tunnel), sharing the same TLS
@@ -89,7 +92,8 @@ pub fn build_quic_server_config(
         .map_err(|e| anyhow::anyhow!("failed to create QUIC server crypto config: {e}"))?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
     let mut transport = quinn::TransportConfig::default();
-    transport.max_concurrent_bidi_streams(8u32.into());
+    transport.max_concurrent_bidi_streams(0u32.into());
+    transport.max_concurrent_uni_streams(32u32.into());
     transport.datagram_receive_buffer_size(Some(65536));
     // Use a very long idle timeout (1 hour) instead of 0 which may cause issues.
     transport.max_idle_timeout(Some(quinn::VarInt::from_u32(3_600_000).into()));
@@ -108,7 +112,8 @@ pub fn build_quic_client_config(
         .map_err(|e| anyhow::anyhow!("failed to create QUIC client crypto config: {e}"))?;
     let mut config = quinn::ClientConfig::new(Arc::new(quic_crypto));
     let mut transport = quinn::TransportConfig::default();
-    transport.max_concurrent_bidi_streams(8u32.into());
+    transport.max_concurrent_bidi_streams(0u32.into());
+    transport.max_concurrent_uni_streams(32u32.into());
     transport.datagram_receive_buffer_size(Some(65536));
     // Use a very long idle timeout (1 hour).
     transport.max_idle_timeout(Some(quinn::VarInt::from_u32(3_600_000).into()));
@@ -139,34 +144,30 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(
+            message, cert, dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(
+            message, cert, dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA512,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-            rustls::SignatureScheme::ED25519,
-        ]
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms.supported_schemes()
     }
 }

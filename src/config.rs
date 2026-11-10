@@ -1,147 +1,163 @@
+use anyhow::Context;
 use serde::Deserialize;
+use std::collections::HashSet;
+use std::net::SocketAddr;
 
-#[derive(Debug, Deserialize, Clone)]
+// These structures contain credentials: intentionally do not derive Debug.
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default = "default_log_level")]
     pub log_level: String,
     pub tunnels: Vec<TunnelConfig>,
 }
 
-fn default_log_level() -> String {
-    "info".into()
-}
+fn default_log_level() -> String { "info".into() }
 
-/// A single remote entry: destination address paired with its authentication
-/// password.  One tunnel can have multiple remotes — the server uses the
-/// password the client presents to decide which target to forward to (port
-/// multiplexing / "端口复用").
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RemoteConfig {
-    /// Target address, e.g. "internal-service:443" or "1.2.3.4:8080".
     pub addr: String,
-    /// Pre-shared password that routes to this target.
     pub password: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct TunnelConfig {
-    /// Local listen address, e.g. "[::]:1017" or "0.0.0.0:1017"
     pub listen: String,
-
-    /// New-style remote list.  Each entry pairs a password with a target
-    /// address.  For client tunnels this typically has one entry (pointing
-    /// at the tunnel server); for server tunnels it has one entry per target
-    /// service, enabling port multiplexing.
     #[serde(default)]
     pub remotes: Vec<RemoteConfig>,
-
-    /// TLS Server Name Indication (SNI) for TLS/QUIC
+    #[serde(default)]
     pub sni: String,
-
-    /// Skip TLS certificate verification (client mode, typically)
     #[serde(default)]
     pub insecure: bool,
-
-    // ── Legacy fields (kept for backward compatibility) ──────────────
-    /// @deprecated Use `remotes[0].addr` instead.
     #[serde(default)]
     pub remote: Option<String>,
-
-    /// @deprecated Use `remotes[0].password` instead.
     #[serde(default)]
     pub password: Option<String>,
-
-    /// Path to TLS certificate PEM file (server mode)
     #[serde(default)]
     pub cert: Option<String>,
-
-    /// Path to TLS private key PEM file (server mode)
     #[serde(default)]
     pub key: Option<String>,
 }
 
 impl TunnelConfig {
-    /// Returns true if this tunnel should act as a TLS server (has cert + key).
     pub fn is_server(&self) -> bool {
         self.cert.is_some() && self.key.is_some()
     }
 
-    /// Returns the normalised list of remote configurations.
-    ///
-    /// When `remotes` is non-empty it is returned directly.  Otherwise the
-    /// legacy `remote`+`password` pair is used to synthesise a single-entry
-    /// list.
     pub fn remotes_list(&self) -> anyhow::Result<Vec<RemoteConfig>> {
         if !self.remotes.is_empty() {
             return Ok(self.remotes.clone());
         }
-        if let (Some(remote), Some(password)) = (&self.remote, &self.password) {
-            return Ok(vec![RemoteConfig {
-                addr: remote.clone(),
-                password: password.clone(),
-            }]);
+        match (&self.remote, &self.password) {
+            (Some(addr), Some(password)) => Ok(vec![RemoteConfig {
+                addr: addr.clone(), password: password.clone(),
+            }]),
+            _ => anyhow::bail!("configure remotes or both remote and password"),
         }
-        anyhow::bail!(
-            "tunnel must have either `remotes` (recommended) or `remote`+`password` configured"
-        );
     }
 
-    /// Returns the default remote address — the first entry in the remotes
-    /// list.  Used by client-mode tunnels.
     pub fn default_remote(&self) -> anyhow::Result<String> {
-        self.remotes_list()?
-            .first()
-            .map(|r| r.addr.clone())
-            .ok_or_else(|| anyhow::anyhow!("no remotes configured"))
+        Ok(self.remotes_list()?.first().context("no remotes configured")?.addr.clone())
     }
 
-    /// Returns the default password — the first entry in the remotes list.
-    /// Used by client-mode tunnels.
     pub fn default_password(&self) -> anyhow::Result<String> {
-        self.remotes_list()?
-            .first()
-            .map(|r| r.password.clone())
-            .ok_or_else(|| anyhow::anyhow!("no remotes configured"))
+        Ok(self.remotes_list()?.first().context("no remotes configured")?.password.clone())
     }
 
-    /// Returns the remotes list directly (for cases where the caller needs
-    /// both password and addr together, e.g. building a sha256→addr map).
-    pub fn remotes_vec(&self) -> anyhow::Result<Vec<RemoteConfig>> {
-        self.remotes_list()
+    /// Strip IPv6 brackets when deriving a TLS server name from host:port.
+    pub fn server_name(&self) -> anyhow::Result<String> {
+        let name = if self.sni.is_empty() {
+            let remote = self.default_remote()?;
+            address_host(&remote)?.to_owned()
+        } else { self.sni.clone() };
+        rustls::pki_types::ServerName::try_from(name.clone()).context("invalid TLS server name")?;
+        Ok(name)
     }
 }
 
-/// Load and parse the YAML config file.
+fn address_host(addr: &str) -> anyhow::Result<&str> {
+    let (host, port) = addr.rsplit_once(':').context("address must include a port")?;
+    let port: u16 = port.parse().context("invalid address port")?;
+    anyhow::ensure!(port != 0, "remote port must not be zero");
+    let host = if host.starts_with('[') && host.ends_with(']') {
+        let host = &host[1..host.len() - 1];
+        host.parse::<std::net::Ipv6Addr>().context("invalid bracketed IPv6 address")?;
+        host
+    } else {
+        anyhow::ensure!(!host.contains(':') && !host.contains('[') && !host.contains(']'),
+            "IPv6 addresses must use [address]:port");
+        host
+    };
+    anyhow::ensure!(!host.is_empty() && !host.chars().any(char::is_whitespace), "invalid address host");
+    rustls::pki_types::ServerName::try_from(host.to_owned()).context("invalid address host")?;
+    Ok(host)
+}
+
 pub fn load_config(path: &str) -> anyhow::Result<Config> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("failed to read config file '{}': {}", path, e))?;
-    let config: Config = serde_yaml::from_str(&content)
-        .map_err(|e| anyhow::anyhow!("failed to parse config: {}", e))?;
-
-    // Validate tunnel entries
-    for (i, t) in config.tunnels.iter().enumerate() {
-        // Ensure at least one remote is configured
-        if t.remotes.is_empty() && t.remote.is_none() {
-            anyhow::bail!(
-                "tunnel[{i}]: must have `remotes` (recommended) or `remote`+`password` configured"
-            );
-        }
-
-        if t.is_server() {
-            // Server mode: cert and key files must exist
-            let cert_path = t.cert.as_ref().unwrap();
-            let key_path = t.key.as_ref().unwrap();
-            if !std::path::Path::new(cert_path).exists() {
-                anyhow::bail!(
-                    "tunnel[{}]: certificate file not found: {}",
-                    i,
-                    cert_path
-                );
+    let content = std::fs::read_to_string(path).with_context(|| format!("read config {path}"))?;
+    // Parser errors can include the offending YAML source line (a secret).
+    // Report location only, never echo configuration contents into logs.
+    let config: Config = serde_yaml::from_str(&content).map_err(|e| {
+        if let Some(location) = e.location() {
+            anyhow::anyhow!("invalid YAML config at line {}, column {}", location.line(), location.column())
+        } else { anyhow::anyhow!("invalid YAML config") }
+    })?;
+    anyhow::ensure!(!config.tunnels.is_empty(), "at least one tunnel is required");
+    anyhow::ensure!(matches!(config.log_level.as_str(), "trace" | "debug" | "info" | "warn" | "error" | "off"),
+        "invalid log_level");
+    let mut listens = HashSet::new();
+    for (i, tunnel) in config.tunnels.iter().enumerate() {
+        let validate = || -> anyhow::Result<()> {
+            let listen: SocketAddr = tunnel.listen.parse().context("listen must be an IP address and port")?;
+            anyhow::ensure!(listen.port() != 0, "listen port must not be zero");
+            anyhow::ensure!(tunnel.cert.is_some() == tunnel.key.is_some(), "cert and key must be configured together");
+            anyhow::ensure!(tunnel.remote.is_some() == tunnel.password.is_some(), "legacy remote and password must be configured together");
+            anyhow::ensure!(tunnel.remotes.is_empty() || tunnel.remote.is_none(), "do not mix remotes with legacy fields");
+            let remotes = tunnel.remotes_list()?;
+            anyhow::ensure!(tunnel.is_server() || remotes.len() == 1, "client tunnels require exactly one remote");
+            let mut passwords = HashSet::new();
+            for remote in &remotes {
+                address_host(&remote.addr).context("invalid remote address")?;
+                anyhow::ensure!(!remote.password.is_empty(), "password must not be empty");
+                anyhow::ensure!(remote.password.len() <= 4096, "password too long");
+                anyhow::ensure!(passwords.insert(remote.password.as_str()), "duplicate remote password");
             }
-            if !std::path::Path::new(key_path).exists() {
-                anyhow::bail!("tunnel[{}]: key file not found: {}", i, key_path);
+            if tunnel.is_server() {
+                for path in [tunnel.cert.as_deref(), tunnel.key.as_deref()].into_iter().flatten() {
+                    anyhow::ensure!(std::path::Path::new(path).is_file(), "certificate/key must be a readable file");
+                }
+                anyhow::ensure!(!tunnel.insecure, "insecure applies only to client tunnels");
+            } else {
+                tunnel.server_name()?;
             }
-        }
+            Ok(())
+        };
+        validate().with_context(|| format!("tunnel[{i}]"))?;
+        let listen: SocketAddr = tunnel.listen.parse()?;
+        anyhow::ensure!(listens.insert(listen), "tunnel[{i}]: duplicate listen address");
     }
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hosts_and_ipv6_brackets_are_validated() {
+        assert_eq!(address_host("[::1]:443").unwrap(), "::1");
+        assert_eq!(address_host("example.com:443").unwrap(), "example.com");
+        for addr in ["::1:443", "host:0", "host:65536", ":443", "bad host:443"] {
+            assert!(address_host(addr).is_err());
+        }
+    }
+
+    #[test]
+    fn secrets_are_required_and_unknown_fields_are_rejected() {
+        let cfg: TunnelConfig = serde_yaml::from_str("listen: '127.0.0.1:1234'\nremote: 'example.com:443'").unwrap();
+        assert!(cfg.remotes_list().is_err());
+        assert!(serde_yaml::from_str::<TunnelConfig>("listen: '127.0.0.1:1234'\ninsecur: true").is_err());
+    }
 }

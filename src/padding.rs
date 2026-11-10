@@ -1,179 +1,154 @@
-//! AnyTLS PaddingScheme.
-//!
-//! This is the mechanism the AnyTLS protocol exists for: it controls the
-//! plaintext size of each underlying TLS write ("packet", counted by call
-//! order on the session's single writer) according to a per-index rule
-//! table, so that the byte-length pattern of a tunnelled "TLS-in-TLS"
-//! connection does not stand out from an ordinary single-layer TLS session.
-//!
-//! Spec: <https://github.com/anytls/anytls-go/blob/main/docs/protocol.md>
-//! (section `paddingScheme 具体含义与实现`).
+//! Bounded AnyTLS-style padding rules. A planned packet is a TLS plaintext
+//! write, not a guarantee about TCP packets or TLS record boundaries.
 
 use md5::{Digest, Md5};
 use rand::Rng;
 use std::collections::HashMap;
 
-/// One segment of a packet's padding rule.
+pub const MAX_SEGMENT_SIZE: usize = 16 * 1024;
+const MAX_PADDING_PER_WRITE: u32 = 64 * 1024;
+const MAX_SCHEME_BYTES: usize = 16 * 1024;
+const MAX_STOP: u32 = 1024;
+const FRAME_HEADER_LEN: usize = 7;
+
 #[derive(Debug, Clone)]
-pub enum Segment {
-    /// Random size in `[lo, hi]` (inclusive). Filled with real data first;
-    /// if real data runs out before reaching this size, the remainder is
-    /// padded with a `cmdWaste` frame.
-    Range(u32, u32),
-    /// Check symbol (`c`): if no real data remains at this point, stop
-    /// processing the rest of this packet's segments — i.e. don't emit
-    /// further obligatory padding once the caller's data is exhausted.
-    Check,
-}
+pub enum Segment { Range(u32, u32), Check }
 
 #[derive(Debug, Clone)]
 pub struct PaddingScheme {
-    /// Packet index at which padding stops being applied. From this index
-    /// onward, writes pass straight through unmodified.
     pub stop: u32,
-    /// rules[i] = segment list for packet index i. Indices with no entry
-    /// (but still < stop) pass through unmodified, same as `stop`.
     pub rules: HashMap<u32, Vec<Segment>>,
-    /// Raw scheme text, kept so its md5 can be computed / compared against
-    /// a peer's `padding-md5`.
     pub raw: String,
 }
 
 impl PaddingScheme {
-    /// The default scheme shipped with anytls-go (see protocol.md). Used by
-    /// both client and server unless a future config option overrides it.
     pub fn default_scheme() -> Self {
         let raw = "stop=8\n\
-                    0=30-30\n\
-                    1=100-400\n\
-                    2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000\n\
-                    3=9-9,500-1000\n\
-                    4=500-1000\n\
-                    5=500-1000\n\
-                    6=500-1000\n\
-                    7=500-1000"
-            .to_string();
-        Self::parse(&raw).expect("built-in default padding scheme must parse")
+                   0=30-30\n\
+                   1=100-400\n\
+                   2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000\n\
+                   3=9-9,500-1000\n\
+                   4=500-1000\n\
+                   5=500-1000\n\
+                   6=500-1000\n\
+                   7=500-1000";
+        Self::parse(raw).expect("built-in padding scheme")
     }
 
-    /// Parse the `key=value` textual scheme format described in protocol.md.
     pub fn parse(raw: &str) -> anyhow::Result<Self> {
-        let mut stop = 0u32;
+        anyhow::ensure!(raw.len() <= MAX_SCHEME_BYTES, "padding scheme too large");
+        let mut stop = None;
         let mut rules = HashMap::new();
-
-        for line in raw.lines() {
-            let line = line.trim();
-            if line.is_empty() {
+        for line in raw.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            let (key, value) = line.split_once('=').ok_or_else(|| anyhow::anyhow!("invalid padding rule"))?;
+            if key.trim() == "stop" {
+                anyhow::ensure!(stop.is_none(), "duplicate padding stop");
+                let parsed: u32 = value.trim().parse()?;
+                anyhow::ensure!(parsed <= MAX_STOP, "padding stop too large");
+                stop = Some(parsed);
                 continue;
             }
-            let (key, value) = line
-                .split_once('=')
-                .ok_or_else(|| anyhow::anyhow!("invalid padding scheme line: {line}"))?;
-            let key = key.trim();
-            if key == "stop" {
-                stop = value.trim().parse()?;
-                continue;
-            }
-            let idx: u32 = key.parse()?;
-            let mut segs = Vec::new();
-            for part in value.split(',') {
-                let part = part.trim();
+            let index: u32 = key.trim().parse()?;
+            anyhow::ensure!(index < MAX_STOP && !rules.contains_key(&index), "invalid/duplicate padding index");
+            let mut segments = Vec::new();
+            let mut maximum = 0u32;
+            for part in value.split(',').map(str::trim) {
+                anyhow::ensure!(segments.len() < 32, "too many padding segments");
                 if part == "c" {
-                    segs.push(Segment::Check);
-                } else if let Some((lo, hi)) = part.split_once('-') {
-                    segs.push(Segment::Range(lo.trim().parse()?, hi.trim().parse()?));
+                    segments.push(Segment::Check);
                 } else {
-                    anyhow::bail!("invalid padding segment: {part}");
+                    let (lo, hi) = part.split_once('-').ok_or_else(|| anyhow::anyhow!("invalid padding range"))?;
+                    let lo: u32 = lo.trim().parse()?;
+                    let hi: u32 = hi.trim().parse()?;
+                    anyhow::ensure!(lo > 0 && lo <= hi && hi <= MAX_SEGMENT_SIZE as u32, "padding range out of bounds");
+                    maximum += hi;
+                    anyhow::ensure!(maximum <= MAX_PADDING_PER_WRITE, "padding write budget exceeded");
+                    segments.push(Segment::Range(lo, hi));
                 }
             }
-            rules.insert(idx, segs);
+            rules.insert(index, segments);
         }
-
-        Ok(Self { stop, rules, raw: raw.to_string() })
+        let stop = stop.ok_or_else(|| anyhow::anyhow!("padding stop missing"))?;
+        anyhow::ensure!(rules.keys().all(|index| *index < stop), "padding rule after stop");
+        Ok(Self { stop, rules, raw: raw.to_owned() })
     }
 
-    /// Lowercase hex MD5 of the raw scheme text — sent as `padding-md5` in
-    /// `cmdSettings` so the peer can detect a scheme mismatch and react
-    /// with `cmdUpdatePaddingScheme`.
     pub fn md5_hex(&self) -> String {
-        let digest = Md5::digest(self.raw.as_bytes());
-        digest.iter().map(|b| format!("{:02x}", b)).collect()
+        Md5::digest(self.raw.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
-    /// Picks a random padding0 length from the rule at index 0 (the
-    /// auth-phase padding, sent alongside `sha256(password)` before the
-    /// session layer even starts). Falls back to 0 if no rule is defined.
     pub fn padding0_len(&self) -> usize {
-        let Some(segs) = self.rules.get(&0) else { return 0 };
-        let mut rng = rand::thread_rng();
-        for seg in segs {
-            if let Segment::Range(lo, hi) = seg {
-                let n = if hi > lo { rng.gen_range(*lo..=*hi) } else { *lo };
-                return n as usize;
+        self.rules.get(&0).and_then(|segments| segments.iter().find_map(|segment| {
+            match segment {
+                Segment::Range(lo, hi) => Some(rand::thread_rng().gen_range(*lo..=*hi) as usize),
+                Segment::Check => None,
             }
-        }
-        0
+        })).unwrap_or(0)
     }
 }
 
-/// One write instruction produced by [`plan_write`]: either real payload
-/// bytes to send verbatim, or a `cmdWaste` filler frame of the given total
-/// on-wire length (7-byte frame header + zero data).
-pub enum Chunk<'a> {
-    Real(&'a [u8]),
-    Waste(usize),
-}
-
-/// Computes how a single logical "packet" (one call to the session's padded
-/// writer) should be split into on-wire chunks, given the current packet
-/// index. Any data left over after the rule's segments are exhausted is
-/// appended as one final unpadded `Real` chunk, per spec: "如果分包发送完
-/// 之后，用户数据仍然有剩余，则直接发送剩余数据".
-pub fn plan_write<'a>(scheme: &PaddingScheme, packet_index: u32, data: &'a [u8]) -> Vec<Chunk<'a>> {
-    if packet_index >= scheme.stop {
-        return vec![Chunk::Real(data)];
-    }
-    let Some(segments) = scheme.rules.get(&packet_index) else {
-        return vec![Chunk::Real(data)];
-    };
-
-    let mut out = Vec::new();
+/// Each output buffer is written once: payload and its waste frame are joined.
+/// Real frame bytes may span consecutive writes, but a waste frame is appended
+/// only after all real frame bytes have been consumed, never inside a frame.
+/// A positive gap below seven bytes requires a minimal seven-byte waste frame;
+/// truncating that frame would corrupt the stream, and silently skipping the
+/// gap would make the planned padding inconsistent.
+pub fn plan_write(scheme: &PaddingScheme, index: u32, data: &[u8]) -> Vec<Vec<u8>> {
+    if index >= scheme.stop { return vec![data.to_vec()]; }
+    let Some(segments) = scheme.rules.get(&index) else { return vec![data.to_vec()] };
     let mut remaining = data;
-    let mut rng = rand::thread_rng();
-
-    for seg in segments {
-        match seg {
-            Segment::Check => {
-                // Checkpoint: once real data is exhausted, stop emitting
-                // further mandatory padding for this packet.
-                if remaining.is_empty() {
-                    return out;
-                }
-            }
+    let mut output = Vec::new();
+    for segment in segments {
+        match segment {
+            Segment::Check if remaining.is_empty() => break,
+            Segment::Check => {}
             Segment::Range(lo, hi) => {
-                let target = if hi > lo { rng.gen_range(*lo..=*hi) } else { *lo } as usize;
-                if remaining.len() >= target {
-                    let (chunk, rest) = remaining.split_at(target);
-                    out.push(Chunk::Real(chunk));
-                    remaining = rest;
-                } else {
-                    let real_len = remaining.len();
-                    if real_len > 0 {
-                        out.push(Chunk::Real(remaining));
-                        remaining = &[];
-                    }
-                    let pad_needed = target.saturating_sub(real_len);
-                    if pad_needed > 0 {
-                        out.push(Chunk::Waste(pad_needed));
-                    }
+                let target = rand::thread_rng().gen_range(*lo..=*hi) as usize;
+                let real_len = remaining.len().min(target);
+                let gap = target - real_len;
+                let waste = if gap > 0 { gap.max(FRAME_HEADER_LEN) } else { 0 };
+                let mut packet = Vec::with_capacity(real_len + waste);
+                packet.extend_from_slice(&remaining[..real_len]);
+                remaining = &remaining[real_len..];
+                if waste > 0 {
+                    packet.extend_from_slice(&[0, 0, 0, 0, 0]); // cmdWaste + stream ID
+                    packet.extend_from_slice(&((waste - FRAME_HEADER_LEN) as u16).to_be_bytes());
+                    packet.resize(real_len + waste, 0);
                 }
+                output.push(packet);
             }
         }
     }
+    if !remaining.is_empty() { output.push(remaining.to_vec()); }
+    output
+}
 
-    if !remaining.is_empty() {
-        out.push(Chunk::Real(remaining));
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_unbounded_and_ambiguous_schemes() {
+        for raw in ["stop=2\n1=10-9", "stop=2\n1=0-0", "stop=2\n1=1-999999",
+            "stop=2\n1=1-1\n1=2-2", "stop=2\nstop=3", "stop=0\n1=1-1", "1=1-1"] {
+            assert!(PaddingScheme::parse(raw).is_err());
+        }
     }
 
-    out
+    #[test]
+    fn payload_and_waste_share_a_write() {
+        let scheme = PaddingScheme::parse("stop=2\n1=20-20").unwrap();
+        let packets = plan_write(&scheme, 1, &[1, 2, 3]);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].len(), 20);
+        assert_eq!(&packets[0][..3], &[1, 2, 3]);
+        assert_eq!(u16::from_be_bytes([packets[0][8], packets[0][9]]), 10);
+    }
+
+    #[test]
+    fn default_and_stop_parse() {
+        let scheme = PaddingScheme::default_scheme();
+        assert_eq!(scheme.padding0_len(), 30);
+        assert_eq!(plan_write(&scheme, 8, &[4, 5]), vec![vec![4, 5]]);
+    }
 }

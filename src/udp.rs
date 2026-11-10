@@ -1,1234 +1,724 @@
-//! UDP tunnel — TUIC v5 working mechanism.
-//!
-//! Implements the *mechanisms* that define TUIC v5 as a protocol (not its
-//! exact wire bytes, since interop with tuic-client/tuic-server is not a
-//! goal here):
-//!
-//!   - Authenticate: `VER(1)=5 | TYPE(1)=0 | UUID(16) | TOKEN(32)`, sent on
-//!     a **unidirectional** stream in parallel with relay traffic — true
-//!     0-RTT, no round trip required before the tunnel starts forwarding.
-//!   - TOKEN is derived with the real TLS Keying Material Exporter
-//!     (RFC 5705) from the live QUIC/TLS session via
-//!     `quinn::Connection::export_keying_material`, with
-//!     `label = UUID bytes`, `context = password bytes` — exactly the
-//!     mechanism the spec describes, not a static password hash.
-//!   - UUID is derived deterministically as `sha256(password)[..16]`, since
-//!     this project has no separate identity/credential store — both peers
-//!     compute the same value from the shared password.
-//!   - Packet: `TYPE(1)=2 | ASSOC_ID(2 BE) | PKT_ID(2 BE) | FRAG_TOTAL(1) |
-//!     FRAG_ID(1) | SIZE(2 BE) | ADDR | DATA`, sent as a QUIC datagram
-//!     (lossy path) or unidirectional stream (lossless path). The server
-//!     mirrors whichever mode the client uses, matching TUIC v5 semantics.
-//!   - UDP fragmentation: oversized payloads are split into multiple Packet
-//!     frames with correct FRAG_TOTAL / FRAG_ID. The server reassembles
-//!     fragments before forwarding.
-//!   - Dissociate: `TYPE(1)=3 | ASSOC_ID(2 BE)`, sent on a short-lived
-//!     unidirectional stream when a local UDP "session" is considered done.
-//!   - Heartbeat: `TYPE(1)=4`, sent periodically as a QUIC datagram to keep
-//!     NAT state alive at the application layer.
-//!   - True full-cone server socket: the per-ASSOC_ID UDP socket is bound
-//!     but never `.connect()`-ed, so it can receive a reply from *any*
-//!     source address and relay it back — matching TUIC's actual NAT
-//!     traversal design, not an artificially restricted single-peer socket.
-//!   - Authentication timeout: if the client does not complete
-//!     authentication within the configured window the server closes the
-//!     connection with error code `0xfffffff2`.
-//!
-//! Scope difference from upstream TUIC, mirroring the TCP/AnyTLS side: this
-//! project is a *fixed* port forwarder (the destination is the tunnel's
-//! configured `remote`, not chosen per-packet by the client), so the ADDR
-//! field is always encoded as `None` and the server ignores it, always
-//! forwarding to its own configured `remote`.
+//! Fixed-destination QUIC UDP relay using TUIC-v5-style commands.
+//! Authentication uses the live TLS exporter after the QUIC handshake; this
+//! is not QUIC 0-RTT and is not wire-compatible with official TUIC clients.
 
-use anyhow::Context;
+use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use quinn::{Connection, VarInt};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
-use tracing::{debug, error, info, warn};
+use tokio::sync::{mpsc, OwnedSemaphorePermit};
+use tokio::task::JoinSet;
 
 use crate::config::TunnelConfig;
+use crate::runtime::{self, Resources, Shutdown, Task, IO_TIMEOUT, MAX_ASSOCIATIONS, MAX_SESSIONS, MAX_UDP_PAYLOAD};
 use crate::tls;
 
-// ── TUIC v5 command types ───────────────────────────────────────────────────
-
 const TUIC_VERSION: u8 = 5;
-const TYPE_AUTHENTICATE: u8 = 0x00;
-const TYPE_PACKET: u8 = 0x02;
-const TYPE_DISSOCIATE: u8 = 0x03;
-const TYPE_HEARTBEAT: u8 = 0x04;
-
-// Address type tags.
-const ADDR_NONE: u8 = 0xFF;
-
-// Packet header: TYPE(1) + ASSOC_ID(2) + PKT_ID(2) + FRAG_TOTAL(1) +
-// FRAG_ID(1) + SIZE(2) + ADDR(1) = 10 bytes (ADDR is always ADDR_NONE).
-const PACKET_HEADER_LEN: usize = 1 + 2 + 2 + 1 + 1 + 2 + 1;
-
-// ── Timing constants ────────────────────────────────────────────────────────
-
-const DISSOCIATE_TIMEOUT: Duration = Duration::from_secs(60);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
-const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
-const REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(10);
-
-// ── TUIC v5 application error codes (RFC‑style close codes) ────────────────
-
+const TYPE_AUTHENTICATE: u8 = 0;
+const TYPE_PACKET: u8 = 2;
+const TYPE_DISSOCIATE: u8 = 3;
+const TYPE_HEARTBEAT: u8 = 4;
+const ADDR_NONE: u8 = 0xff;
+const HEADER_LEN: usize = 10;
+const AUTH_LEN: usize = 50;
 const ERROR_PROTOCOL: u32 = 0xfffffff0;
-const ERROR_AUTHENTICATION_FAILED: u32 = 0xfffffff1;
-const ERROR_AUTHENTICATION_TIMEOUT: u32 = 0xfffffff2;
-const ERROR_BAD_COMMAND: u32 = 0xfffffff3;
-
-// ── Transport ───────────────────────────────────────────────────────────────
-
-/// Fallback datagram payload limit used when the QUIC connection hasn't
-/// completed path MTU discovery yet.  Once PMTUD settles,
-/// `conn.max_datagram_size()` provides the real limit, which is typically
-/// large enough (~1400 B) that most TUIC packets fit in a single datagram
-/// without fragmentation.
-const DEFAULT_DATAGRAM_PAYLOAD: usize = 1200;
-
-/// Queries the QUIC connection for its actual maximum datagram payload size.
-/// Falls back to `DEFAULT_DATAGRAM_PAYLOAD` while PMTUD is still in flight.
-fn datagram_payload_limit(conn: &Connection) -> usize {
-    conn.max_datagram_size()
-        .map(|max_dgram| max_dgram.saturating_sub(PACKET_HEADER_LEN))
-        .unwrap_or(DEFAULT_DATAGRAM_PAYLOAD)
-}
-
-/// Maximum number of in-flight incomplete reassembly buffers per assoc.
-/// When this limit is reached the oldest incomplete buffer is evicted to
-/// make room — matching the defensive bound used by upstream TUIC
-/// implementations.
+const ERROR_AUTH: u32 = 0xfffffff1;
+const ERROR_AUTH_TIMEOUT: u32 = 0xfffffff2;
+const ASSOC_TIMEOUT: Duration = Duration::from_secs(60);
+const REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(10);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_REASSEMBLY_BUFFERS: usize = 64;
+const MAX_ASSOC_REASSEMBLY_BYTES: usize = 256 * 1024;
+const COMMAND_QUEUE: usize = 64;
 
-/// The relay transport mode for TUIC Packet commands.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum RelayMode {
-    /// Lossy: Packet frames sent as QUIC datagrams (native mode).
-    Datagram,
-    /// Lossless: Packet frames sent over unidirectional QUIC streams.
-    Stream,
-}
-
-// ── Reassembly buffer ───────────────────────────────────────────────────────
-
-/// Buffers fragments of one UDP packet (identified by `pkt_id`) while waiting
-/// for all fragments to arrive.  Discarded if incomplete for longer than
-/// `REASSEMBLY_TIMEOUT`.
-struct ReassemblyBuffer {
-    fragments: Vec<Option<Vec<u8>>>,
-    total: u8,
-    received: u8,
-    created: Instant,
-}
-
-impl ReassemblyBuffer {
-    fn new(total: u8) -> Self {
-        Self {
-            fragments: (0..total).map(|_| None).collect(),
-            total,
-            received: 0,
-            created: Instant::now(),
-        }
-    }
-
-    /// Insert one fragment.  Returns `true` when all fragments have been
-    /// received and the buffer is ready to be assembled.
-    fn insert(&mut self, frag_id: u8, payload: &[u8]) -> bool {
-        if frag_id >= self.total || self.fragments[frag_id as usize].is_some() {
-            // Duplicate or out-of-bounds — ignore gracefully so a replayed
-            // fragment doesn't corrupt the buffer.
-            return false;
-        }
-        self.fragments[frag_id as usize] = Some(payload.to_vec());
-        self.received += 1;
-        self.received == self.total
-    }
-
-    /// Concatenate all fragments in order.  Call only after `insert` returned
-    /// `true`.
-    fn assemble(self) -> Vec<u8> {
-        let total_len: usize = self
-            .fragments
-            .iter()
-            .map(|f| f.as_ref().map_or(0, |v| v.len()))
-            .sum();
-        let mut out = Vec::with_capacity(total_len);
-        for frag in self.fragments {
-            if let Some(data) = frag {
-                out.extend_from_slice(&data);
-            }
-        }
-        out
-    }
-
-    fn is_stale(&self) -> bool {
-        self.created.elapsed() > REASSEMBLY_TIMEOUT
-    }
-}
-
-// ── Authentication helpers ──────────────────────────────────────────────────
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RelayMode { Datagram, Stream }
 
 fn derive_uuid(password: &str) -> [u8; 16] {
-    let hash = Sha256::digest(password.as_bytes());
-    hash[..16].try_into().unwrap()
+    let digest = Sha256::digest(password.as_bytes());
+    let mut uuid = [0; 16];
+    uuid.copy_from_slice(&digest[..16]);
+    uuid
 }
 
-/// Derives the TUIC v5 auth token using the connection's own TLS exported
-/// keying material (RFC 5705), exactly as the real spec defines: label is
-/// the client's UUID, context is the raw shared password.
-fn derive_token(conn: &Connection, uuid: &[u8; 16], password: &str) -> anyhow::Result<[u8; 32]> {
-    let mut out = [0u8; 32];
-    conn.export_keying_material(&mut out, uuid, password.as_bytes())
-        .map_err(|e| anyhow::anyhow!("failed to export TLS keying material: {e:?}"))?;
-    Ok(out)
+fn derive_token(conn: &Connection, uuid: &[u8; 16], password: &str) -> Result<[u8; 32]> {
+    let mut token = [0; 32];
+    conn.export_keying_material(&mut token, uuid, password.as_bytes())
+        .map_err(|_| anyhow!("TLS exporter failed"))?;
+    Ok(token)
 }
 
-fn build_authenticate(uuid: &[u8; 16], token: &[u8; 32]) -> Vec<u8> {
-    let mut b = Vec::with_capacity(2 + 16 + 32);
-    b.push(TUIC_VERSION);
-    b.push(TYPE_AUTHENTICATE);
-    b.extend_from_slice(uuid);
-    b.extend_from_slice(token);
-    b
-}
-
-// ── Packet frame building ───────────────────────────────────────────────────
-
-/// Build one Packet frame (possibly a fragment when `frag_total > 1`).
-fn build_packet_fragment(
-    assoc_id: u16,
-    pkt_id: u16,
-    frag_total: u8,
-    frag_id: u8,
-    payload: &[u8],
-) -> Vec<u8> {
-    let mut b = Vec::with_capacity(PACKET_HEADER_LEN + payload.len());
-    b.push(TYPE_PACKET);
-    b.extend_from_slice(&assoc_id.to_be_bytes());
-    b.extend_from_slice(&pkt_id.to_be_bytes());
-    b.push(frag_total);
-    b.push(frag_id);
-    b.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-    b.push(ADDR_NONE);
-    b.extend_from_slice(payload);
-    b
-}
-
-/// Convenience: single-fragment Packet (the common case).
-fn build_packet(assoc_id: u16, pkt_id: u16, payload: &[u8]) -> Vec<u8> {
-    build_packet_fragment(assoc_id, pkt_id, 1, 0, payload)
-}
-
-/// Splits a payload into one or more Packet frames, fragmenting when the
-/// payload exceeds `max_payload`.  Callers should derive `max_payload` from
-/// `datagram_payload_limit(conn)` so that the fragmentation threshold
-/// reflects the actual QUIC path MTU instead of a conservative hard‑coded
-/// constant.
-fn build_packet_maybe_fragmented(assoc_id: u16, pkt_id: u16, payload: &[u8], max_payload: usize) -> Vec<Vec<u8>> {
-    if payload.len() <= max_payload {
-        return vec![build_packet(assoc_id, pkt_id, payload)];
+fn packet_frames(assoc: u16, packet: u16, data: &[u8], max_payload: usize) -> Result<Vec<Vec<u8>>> {
+    anyhow::ensure!(data.len() <= MAX_UDP_PAYLOAD, "UDP payload too large");
+    anyhow::ensure!(max_payload > 0, "QUIC datagrams unavailable or too small");
+    let max_payload = max_payload.min(MAX_UDP_PAYLOAD);
+    let count = if data.is_empty() { 1 } else { (data.len() - 1) / max_payload + 1 };
+    let total = u8::try_from(count).context("too many UDP fragments")?;
+    let mut frames = Vec::with_capacity(count);
+    for fragment in 0..total {
+        let start = fragment as usize * max_payload;
+        let end = (start + max_payload).min(data.len());
+        let payload = &data[start..end];
+        let mut frame = Vec::with_capacity(HEADER_LEN + payload.len());
+        frame.push(TYPE_PACKET);
+        frame.extend_from_slice(&assoc.to_be_bytes());
+        frame.extend_from_slice(&packet.to_be_bytes());
+        frame.push(total);
+        frame.push(fragment);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        frame.push(ADDR_NONE);
+        frame.extend_from_slice(payload);
+        frames.push(frame);
     }
-    let frag_total =
-        ((payload.len() + max_payload - 1) / max_payload) as u8;
-    (0..frag_total)
-        .map(|frag_id| {
-            let start = frag_id as usize * max_payload;
-            let end = std::cmp::min(start + max_payload, payload.len());
-            build_packet_fragment(assoc_id, pkt_id, frag_total, frag_id, &payload[start..end])
-        })
-        .collect()
+    Ok(frames)
 }
 
-// ── Packet frame parsing ────────────────────────────────────────────────────
+struct Packet<'a> {
+    assoc: u16,
+    id: u16,
+    total: u8,
+    fragment: u8,
+    data: &'a [u8],
+}
 
-/// Parses a Packet frame from raw bytes.  Returns
-/// `(assoc_id, pkt_id, frag_total, frag_id, payload_slice)` on success.
-fn parse_packet(data: &[u8]) -> Option<(u16, u16, u8, u8, &[u8])> {
-    if data.is_empty() || data[0] != TYPE_PACKET {
+fn parse_packet(frame: &[u8]) -> Option<Packet<'_>> {
+    if frame.len() < HEADER_LEN || frame[0] != TYPE_PACKET || frame[9] != ADDR_NONE {
         return None;
     }
-    if data.len() < PACKET_HEADER_LEN {
+    let len = u16::from_be_bytes([frame[7], frame[8]]) as usize;
+    if frame[5] == 0 || frame[6] >= frame[5] || frame.len() != HEADER_LEN + len
+        || len > MAX_UDP_PAYLOAD {
         return None;
     }
-    let assoc_id = u16::from_be_bytes([data[1], data[2]]);
-    let pkt_id = u16::from_be_bytes([data[3], data[4]]);
-    let frag_total = data[5];
-    let frag_id = data[6];
-    let size = u16::from_be_bytes([data[7], data[8]]) as usize;
-    // ADDR is fixed-length ADDR_NONE (1 byte) in this implementation.
-    let payload_start = PACKET_HEADER_LEN;
-    if frag_total == 0 || frag_id >= frag_total {
-        return None;
+    let assoc = u16::from_be_bytes([frame[1], frame[2]]);
+    if assoc == 0 { return None; }
+    Some(Packet {
+        assoc,
+        id: u16::from_be_bytes([frame[3], frame[4]]),
+        total: frame[5],
+        fragment: frame[6],
+        data: &frame[HEADER_LEN..],
+    })
+}
+
+struct Fragment {
+    data: Vec<u8>,
+    _permit: OwnedSemaphorePermit,
+}
+
+struct ReassemblyBuffer {
+    fragments: Vec<Option<Fragment>>,
+    received: u8,
+    bytes: usize,
+    created: Instant,
+    _metadata: OwnedSemaphorePermit,
+}
+
+#[derive(Default)]
+struct Reassembly {
+    packets: HashMap<u16, ReassemblyBuffer>,
+}
+
+impl Reassembly {
+    fn cleanup(&mut self) {
+        self.packets.retain(|_, packet| packet.created.elapsed() < REASSEMBLY_TIMEOUT);
     }
-    if payload_start + size > data.len() {
-        return None;
-    }
-    Some((
-        assoc_id,
-        pkt_id,
-        frag_total,
-        frag_id,
-        &data[payload_start..payload_start + size],
-    ))
-}
 
-// ── Other command builders ──────────────────────────────────────────────────
-
-fn build_dissociate(assoc_id: u16) -> Vec<u8> {
-    let mut b = Vec::with_capacity(3);
-    b.push(TYPE_DISSOCIATE);
-    b.extend_from_slice(&assoc_id.to_be_bytes());
-    b
-}
-
-fn build_heartbeat() -> Vec<u8> {
-    vec![TYPE_HEARTBEAT]
-}
-
-// ── Reply helper ────────────────────────────────────────────────────────────
-
-/// Sends one Packet frame back to the client using the relay mode the client
-/// originally chose.  Returns `true` on success.
-async fn send_packet_reply(
-    conn: &Connection,
-    pkt: Vec<u8>,
-    mode: RelayMode,
-) -> bool {
-    match mode {
-        RelayMode::Datagram => {
-            conn.send_datagram(Bytes::from(pkt)).is_ok()
+    fn insert(&mut self, packet: &Packet<'_>, resources: &Resources) -> Option<Vec<u8>> {
+        self.cleanup();
+        if packet.total == 1 {
+            // A wrapped ID must not retain an old incomplete packet.
+            self.packets.remove(&packet.id);
+            return Some(packet.data.to_vec());
         }
-        RelayMode::Stream => {
-            match conn.open_uni().await {
-                Ok(mut s) => {
-                    if s.write_all(&pkt).await.is_err() {
-                        return false;
-                    }
-                    s.finish().is_ok()
+        if self.packets.get(&packet.id).is_some_and(|buffer| buffer.fragments.len() != packet.total as usize) {
+            self.packets.remove(&packet.id);
+        }
+        if !self.packets.contains_key(&packet.id) && self.packets.len() >= MAX_REASSEMBLY_BUFFERS {
+            let oldest = self.packets.iter().min_by_key(|(_, buffer)| buffer.created).map(|(&id, _)| id);
+            if let Some(id) = oldest { self.packets.remove(&id); }
+        }
+        let buffered: usize = self.packets.values().map(|buffer| buffer.bytes).sum();
+        if buffered + packet.data.len() > MAX_ASSOC_REASSEMBLY_BYTES { return None; }
+        if !self.packets.contains_key(&packet.id) {
+            let metadata = resources.fragment(packet.total as usize * 128 + 128)?;
+            self.packets.insert(packet.id, ReassemblyBuffer {
+                fragments: (0..packet.total).map(|_| None).collect(),
+                received: 0,
+                bytes: 0,
+                created: Instant::now(),
+                _metadata: metadata,
+            });
+        }
+        let buffer = self.packets.get_mut(&packet.id)?;
+        let index = packet.fragment as usize;
+        if buffer.fragments[index].is_some() { return None; }
+        if buffer.bytes + packet.data.len() > MAX_UDP_PAYLOAD {
+            self.packets.remove(&packet.id);
+            return None;
+        }
+        // Charge payload plus per-fragment bookkeeping to a process-wide
+        // budget. Permits are released on expiry, eviction and cancellation.
+        let permit = resources.fragment(packet.data.len() + 128)?;
+        buffer.fragments[index] = Some(Fragment { data: packet.data.to_vec(), _permit: permit });
+        buffer.bytes += packet.data.len();
+        buffer.received += 1;
+        if buffer.received as usize != buffer.fragments.len() { return None; }
+        let buffer = self.packets.remove(&packet.id)?;
+        let mut payload = Vec::with_capacity(buffer.bytes);
+        for fragment in buffer.fragments.into_iter().flatten() {
+            payload.extend_from_slice(&fragment.data);
+        }
+        Some(payload)
+    }
+}
+
+async fn send_command(conn: &Connection, frame: &[u8]) -> Result<()> {
+    tokio::time::timeout(IO_TIMEOUT, async {
+        let mut stream = conn.open_uni().await?;
+        stream.write_all(frame).await?;
+        stream.finish()?;
+        Result::Ok(())
+    }).await.context("QUIC command write timed out")?
+}
+
+async fn send_packet(conn: &Connection, assoc: u16, id: u16, data: &[u8], mode: RelayMode) -> Result<()> {
+    // Re-query for every packet: path MTU can change during a connection.
+    let limit = match mode {
+        RelayMode::Datagram => conn.max_datagram_size()
+            .context("peer does not support datagrams")?.saturating_sub(HEADER_LEN),
+        RelayMode::Stream => MAX_UDP_PAYLOAD,
+    };
+    for frame in packet_frames(assoc, id, data, limit)? {
+        match mode {
+            RelayMode::Datagram => {
+                if let Err(e) = conn.send_datagram(Bytes::from(frame)) {
+                    if conn.close_reason().is_some() { return Err(e.into()); }
+                    // MTU races/buffer pressure lose this UDP packet, not the
+                    // association. The next packet uses a fresh MTU value.
+                    tracing::debug!("QUIC datagram dropped: {e}");
+                    break;
                 }
-                Err(_) => false,
             }
+            RelayMode::Stream => send_command(conn, &frame).await?,
         }
     }
-}
-
-// ── Server ──────────────────────────────────────────────────────────────────
-
-pub async fn run_udp_server(config: &TunnelConfig) -> anyhow::Result<()> {
-    let cert = config.cert.as_ref().context("server mode requires `cert`")?;
-    let key = config.key.as_ref().context("server mode requires `key`")?;
-
-    let rustls_config = tls::build_rustls_server_config(cert, key)?;
-    let quic_config = tls::build_quic_server_config(rustls_config)?;
-
-    let listen_addr: SocketAddr = config.listen.parse().context("invalid `listen` address")?;
-    let endpoint = quinn::Endpoint::server(quic_config, listen_addr)
-        .context("failed to bind QUIC endpoint")?;
-
-    info!("[TUIC server] listening on {listen_addr} (QUIC)");
-
-    let remotes = config.remotes_vec()?;
-    // Build uuid → (password, remote_addr) lookup map for port multiplexing:
-    // the UUID the client sends (derived from its password) determines which
-    // backend to forward to.
-    let remote_map: Arc<HashMap<[u8; 16], (String, String)>> = Arc::new(
-        remotes
-            .iter()
-            .map(|r| (derive_uuid(&r.password), (r.password.clone(), r.addr.clone())))
-            .collect(),
-    );
-
-    // JoinSet tracks per‑connection tasks so they can be aborted when the
-    // endpoint exits (sing‑box pattern: closing the server cascades to
-    // close all accepted QUIC connections).
-    let mut tasks = tokio::task::JoinSet::new();
-
-    loop {
-        tokio::select! {
-            accept = endpoint.accept() => {
-                let incoming = match accept {
-                    Some(inc) => inc,
-                    None => break,
-                };
-                let remote_map = remote_map.clone();
-                let peer = incoming.remote_address();
-
-                tasks.spawn(async move {
-                    match incoming.await {
-                        Ok(conn) => {
-                            if let Err(e) =
-                                handle_tuic_connection(conn, remote_map).await
-                            {
-                                error!("[TUIC server] connection from {peer}: {e:#}");
-                            }
-                        }
-                        Err(e) => warn!("[TUIC server] QUIC handshake with {peer} failed: {e}"),
-                    }
-                });
-            }
-            // Periodically reap finished tasks.
-            _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                while tasks.try_join_next().is_some() {}
-            }
-        }
-    }
-
-    // Endpoint closed — abort remaining connection tasks (sing‑box
-    // cascade: h.server.Close() terminates all sessions).
-    tasks.abort_all();
-    while tasks.join_next().await.is_some() {}
-
     Ok(())
 }
 
-/// Per‑assoc_id server‑side relay state.  The UDP socket is bound but never
-/// `.connect()`‑ed, so it behaves as a true full‑cone socket: it can accept a
-/// reply from any source address.
-///
-/// `state` bundles `mode` and `last_seen` behind a **single** `Mutex` so the
-/// hot path (one read + one write per Packet) acquires only one lock instead
-/// of two.
-struct AssocState {
-    mode: RelayMode,
-    last_seen: Instant,
+async fn read_auth(conn: &Connection) -> Result<Vec<u8>> {
+    let mut stream = conn.accept_uni().await?;
+    let data = stream.read_to_end(AUTH_LEN).await?;
+    anyhow::ensure!(data.len() == AUTH_LEN && data[0] == TUIC_VERSION && data[1] == TYPE_AUTHENTICATE,
+        "invalid authentication command");
+    Ok(data)
+}
+
+/// Read complete stream commands independently so a stream without FIN cannot
+/// stop datagrams/heartbeats. JoinSet owns and continuously reaps read tasks.
+async fn read_commands(conn: Connection, tx: mpsc::Sender<(Vec<u8>, RelayMode)>) -> Result<()> {
+    let mut tasks = JoinSet::new();
+    loop {
+        tokio::select! {
+            result = tasks.join_next(), if !tasks.is_empty() => {
+                match result {
+                    Some(Ok(Ok(data))) => {
+                        tokio::time::timeout(IO_TIMEOUT, tx.send((data, RelayMode::Stream))).await??;
+                    }
+                    Some(Ok(Err(e))) => tracing::debug!("QUIC command read failed: {e:#}"),
+                    Some(Err(e)) => return Err(e.into()),
+                    None => {}
+                }
+            }
+            stream = conn.accept_uni(), if tasks.len() < 32 => {
+                let mut stream = stream?;
+                tasks.spawn(async move {
+                    tokio::time::timeout(IO_TIMEOUT, stream.read_to_end(HEADER_LEN + MAX_UDP_PAYLOAD))
+                        .await.context("QUIC command read timed out")?
+                        .map_err(anyhow::Error::from)
+                });
+            }
+        }
+    }
+}
+
+pub async fn run_udp_server(cfg: &TunnelConfig, resources: Resources, shutdown: Shutdown) -> Result<()> {
+    let rustls = tls::build_rustls_server_config(
+        cfg.cert.as_deref().context("server requires cert")?,
+        cfg.key.as_deref().context("server requires key")?,
+    )?;
+    let _endpoint_permit = resources.socket()?;
+    let endpoint = quinn::Endpoint::server(tls::build_quic_server_config(rustls)?, cfg.listen.parse()?)?;
+    let remote_map = Arc::new(cfg.remotes_list()?.into_iter()
+        .map(|remote| (derive_uuid(&remote.password), (remote.password, remote.addr)))
+        .collect::<HashMap<_, _>>());
+    let mut tasks = JoinSet::new();
+    tracing::info!("[TUIC server] listening on {}", cfg.listen);
+    loop {
+        while let Some(result) = tasks.try_join_next() {
+            if let Err(e) = result { tracing::warn!("QUIC session task failed: {e}"); }
+        }
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            result = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(Err(e)) = result { tracing::warn!("QUIC session task failed: {e}"); }
+            }
+            incoming = endpoint.accept() => {
+                let Some(incoming) = incoming else { break };
+                if tasks.len() >= MAX_SESSIONS {
+                    incoming.refuse();
+                    continue;
+                }
+                let permit = match resources.socket() {
+                    Ok(permit) => permit,
+                    Err(_) => { incoming.refuse(); continue; }
+                };
+                let remotes = remote_map.clone();
+                let resources = resources.clone();
+                let session_shutdown = shutdown.clone();
+                tasks.spawn(async move {
+                    let _permit = permit;
+                    let result = async {
+                        let connecting = incoming.accept()?;
+                        let conn = tokio::time::timeout(IO_TIMEOUT, connecting).await.context("QUIC handshake timed out")??;
+                        let result = server_connection(&conn, remotes, resources, session_shutdown).await;
+                        conn.close(VarInt::from_u32(ERROR_PROTOCOL), b"session ended");
+                        result
+                    }.await;
+                    if let Err(e) = result { tracing::debug!("[TUIC server] connection ended: {e:#}"); }
+                });
+            }
+        }
+    }
+    endpoint.close(VarInt::from_u32(0), b"shutdown");
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+    Ok(())
 }
 
 struct ServerAssoc {
-    sock: Arc<UdpSocket>,
-    state: Mutex<AssocState>,
-    /// Fragmented‑packet reassembly buffers, keyed by `pkt_id`.
-    reassembly: Mutex<HashMap<u16, ReassemblyBuffer>>,
-    /// Handle to the reply‑pump task spawned for this assoc.  Stored so the
-    /// task can be explicitly aborted on Dissociate (matching upstream
-    /// TUIC's cleanup behaviour).
-    reply_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    socket: Arc<UdpSocket>,
+    mode: RelayMode,
+    last_seen: Instant,
+    reassembly: Reassembly,
+    last_reply_activity: Arc<std::sync::Mutex<Instant>>,
+    next_packet: u32,
+    next_packet_wrap: Instant,
+    _pump: Task<()>,
+    _permit: OwnedSemaphorePermit,
 }
 
-impl ServerAssoc {
-    fn new(sock: Arc<UdpSocket>, mode: RelayMode) -> Self {
-        Self {
-            sock,
-            state: Mutex::new(AssocState {
-                mode,
-                last_seen: Instant::now(),
-            }),
-            reassembly: Mutex::new(HashMap::new()),
-            reply_handle: Mutex::new(None),
-        }
-    }
-}
-
-// ── Connection handler ──────────────────────────────────────────────────────
-
-async fn handle_tuic_connection(
-    conn: Connection,
-    remote_map: Arc<HashMap<[u8; 16], (String, String)>>,
-) -> anyhow::Result<()> {
-    let peer = conn.remote_address();
-    info!("[TUIC server] new QUIC connection from {peer}");
-
-    // ── Authenticate with timeout ───────────────────────────────────────
-    let auth_result = tokio::time::timeout(AUTH_TIMEOUT, async {
-        let mut auth_stream = conn.accept_uni().await?;
-        auth_stream
-            .read_to_end(2 + 16 + 32)
-            .await
-            .map_err(|e| anyhow::anyhow!("read Authenticate: {e}"))
-    })
-    .await;
-
-    let auth_data = match auth_result {
-        Ok(Ok(data)) => data,
-        Ok(Err(e)) => {
-            let _ = conn.close(
-                VarInt::from_u32(ERROR_AUTHENTICATION_FAILED),
-                b"authentication failed",
-            );
-            anyhow::bail!("auth read error from {peer}: {e:#}");
-        }
-        Err(_elapsed) => {
-            let _ = conn.close(
-                VarInt::from_u32(ERROR_AUTHENTICATION_TIMEOUT),
-                b"authentication timeout",
-            );
-            anyhow::bail!("authentication timeout from {peer}");
-        }
-    };
-
-    if auth_data.len() < 2 + 16 + 32 {
-        let _ = conn.close(
-            VarInt::from_u32(ERROR_BAD_COMMAND),
-            b"truncated Authenticate",
-        );
-        anyhow::bail!("truncated Authenticate from {peer}");
-    }
-    if auth_data[0] != TUIC_VERSION {
-        let _ = conn.close(
-            VarInt::from_u32(ERROR_PROTOCOL),
-            b"unsupported TUIC version",
-        );
-        anyhow::bail!("unsupported TUIC version {} from {peer}", auth_data[0]);
-    }
-    if auth_data[1] != TYPE_AUTHENTICATE {
-        let _ = conn.close(
-            VarInt::from_u32(ERROR_BAD_COMMAND),
-            b"expected Authenticate",
-        );
-        anyhow::bail!(
-            "expected Authenticate, got type {} from {peer}",
-            auth_data[1]
-        );
-    }
-
-    let recv_uuid: [u8; 16] = auth_data[2..18].try_into().unwrap();
-    let recv_token: [u8; 32] = auth_data[18..50].try_into().unwrap();
-
-    // Look up which password → backend mapping this UUID belongs to.
-    // This is the port-multiplexing core: the client's password (encoded as
-    // its UUID) determines which target address to forward to.
-    let (password, remote_addr) = match remote_map.get(&recv_uuid) {
-        Some((pwd, addr)) => (pwd.clone(), addr.clone()),
-        None => {
-            let _ = conn.close(
-                VarInt::from_u32(ERROR_AUTHENTICATION_FAILED),
-                b"authentication failed",
-            );
-            anyhow::bail!("auth failed from {peer}: unknown UUID");
-        }
-    };
-
-    let expected_token = derive_token(&conn, &recv_uuid, &password).map_err(|e| {
-        let _ = conn.close(
-            VarInt::from_u32(ERROR_AUTHENTICATION_FAILED),
-            b"token derivation failed",
-        );
-        e
-    })?;
-
-    if recv_token != expected_token {
-        let _ = conn.close(
-            VarInt::from_u32(ERROR_AUTHENTICATION_FAILED),
-            b"authentication failed",
-        );
-        anyhow::bail!("auth failed from {peer}: token mismatch");
-    }
-
-    let remote = Arc::new(remote_addr);
-    info!("[TUIC server] auth ok from {peer}");
-
-    let assocs: Arc<Mutex<HashMap<u16, Arc<ServerAssoc>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-
-    // Packet‑id counter shared across all assocs (TUIC PKT_ID is scoped by
-    // ASSOC_ID, so a single counter is fine).
-    let pkt_id_ctr = Arc::new(AtomicU16::new(0));
-
-    // Background janitor: drop stale assocs and reassembly buffers.
-    let janitor_handle = {
-        let assocs = assocs.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(DISSOCIATE_TIMEOUT / 2).await;
-                let mut map = assocs.lock().await;
-                let mut stale = Vec::new();
-                for (id, a) in map.iter() {
-                    let mut reassembly = a.reassembly.lock().await;
-                    reassembly.retain(|_, buf| !buf.is_stale());
-                    if a.state.lock().await.last_seen.elapsed() > DISSOCIATE_TIMEOUT {
-                        stale.push(*id);
-                    }
-                }
-                for id in stale {
-                    if let Some(assoc) = map.remove(&id) {
-                        if let Some(handle) =
-                            assoc.reply_handle.lock().await.take()
-                        {
-                            handle.abort();
-                        }
-                    }
-                }
-            }
-        })
-    };
-
-    // Run datagram and stream receivers concurrently — whichever channel the
-    // client chooses for a Packet, the server handles it.  When either loop
-    // exits (connection closed) the other is cancelled.
-    let dgram_loop = run_datagram_loop(&conn, assocs.clone(), remote.clone(), &pkt_id_ctr);
-    let stream_loop = run_stream_loop(&conn, assocs.clone(), remote.clone(), &pkt_id_ctr);
-
-    tokio::select! {
-        r = dgram_loop => {
-            if let Err(e) = r {
-                debug!("[TUIC server] datagram loop: {e}");
-            }
-        }
-        r = stream_loop => {
-            if let Err(e) = r {
-                debug!("[TUIC server] stream loop: {e}");
-            }
-        }
-    }
-
-    janitor_handle.abort();
-
-    // Drain every remaining assoc so that reply-pump tasks and their UDP
-    // sockets are released promptly.  Without this, each QUIC connection
-    // that dies (idle timeout, network loss, …) leaves behind one zombie
-    // reply-pump task per assoc, each holding a UDP socket FD — a slow
-    // leak that eventually exhausts the process file-descriptor limit.
-    let remaining: Vec<_> = assocs.lock().await.drain().map(|(_, a)| a).collect();
-    for assoc in remaining {
-        if let Some(handle) = assoc.reply_handle.lock().await.take() {
-            handle.abort();
-        }
-    }
-
-    Ok(())
-}
-
-// ── Shared command dispatch ─────────────────────────────────────────────────
-
-/// Process one TUIC command (the payload after VER+TYPE for Authenticate, or
-/// the full frame for Packet / Dissociate / Heartbeat).  Called from both the
-/// datagram and stream receive loops.
-///
-/// `from_mode` indicates which transport channel the command arrived on; it is
-/// recorded on the `ServerAssoc` when a new assoc is created so that the reply
-/// pump can mirror it.
-async fn dispatch_command(
-    cmd_data: &[u8],
-    from_mode: RelayMode,
-    assocs: &Arc<Mutex<HashMap<u16, Arc<ServerAssoc>>>>,
-    remote: &str,
+async fn server_connection(
     conn: &Connection,
-    pkt_id_ctr: &Arc<AtomicU16>,
-) {
-    if cmd_data.is_empty() {
-        return;
+    remotes: Arc<HashMap<[u8; 16], (String, String)>>,
+    resources: Resources,
+    shutdown: Shutdown,
+) -> Result<()> {
+    let auth = match tokio::time::timeout(IO_TIMEOUT, read_auth(conn)).await {
+        Ok(Ok(auth)) => auth,
+        result => {
+            let code = if result.is_err() { ERROR_AUTH_TIMEOUT } else { ERROR_AUTH };
+            conn.close(VarInt::from_u32(code), b"authentication failed");
+            return Err(anyhow!("QUIC authentication failed or timed out"));
+        }
+    };
+    let mut uuid = [0; 16];
+    uuid.copy_from_slice(&auth[2..18]);
+    let (password, remote) = remotes.get(&uuid).context("unknown credential")?;
+    let token = derive_token(conn, &uuid, password)?;
+    // Constant-time token comparison, without exposing token bytes to logs.
+    let matches = bool::from(token.as_slice().ct_eq(&auth[18..]));
+    anyhow::ensure!(matches, "invalid authentication token");
+    // Resolve once per authenticated connection; no blocking DNS per packet.
+    // Try family-appropriate sockets for all candidates, including systems
+    // without IPv6 even when DNS returns an AAAA record first.
+    let mut backend = None;
+    for remote in runtime::resolve(remote).await? {
+        let _probe_permit = resources.socket()?;
+        if UdpSocket::bind(runtime::unspecified_for(remote)).await.is_ok() {
+            backend = Some(remote);
+            break;
+        }
     }
-
-    match cmd_data[0] {
-        TYPE_PACKET => {
-            let Some((assoc_id, pkt_id, frag_total, frag_id, payload)) =
-                parse_packet(cmd_data)
-            else {
-                warn!(
-                    "[TUIC server] malformed Packet ({} bytes, mode={from_mode:?})",
-                    cmd_data.len()
-                );
-                return;
+    let remote = backend.context("no supported UDP backend address family")?;
+    let (command_tx, mut command_rx) = mpsc::channel(COMMAND_QUEUE);
+    let stream_conn = conn.clone();
+    let mut command_task = Task::spawn(async move {
+        let result = read_commands(stream_conn.clone(), command_tx).await;
+        if result.is_err() { stream_conn.close(VarInt::from_u32(ERROR_PROTOCOL), b"command reader failed"); }
+    });
+    let (reply_tx, mut replies) = mpsc::channel::<(u16, Vec<u8>)>(COMMAND_QUEUE);
+    let mut assocs: HashMap<u16, ServerAssoc> = HashMap::new();
+    // Association IDs are not recycled in one connection. Tombstones stop a
+    // delayed datagram from recreating an association after Dissociate/expiry.
+    let mut retired = vec![false; u16::MAX as usize + 1];
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    let result: Result<()> = async {
+        loop {
+            enum Event {
+                Command(Vec<u8>, RelayMode),
+                Reply(u16, Vec<u8>),
+                Tick,
+            }
+            let event = tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = conn.closed() => break,
+                result = conn.read_datagram() => Event::Command(result?.to_vec(), RelayMode::Datagram),
+                command = command_rx.recv() => match command {
+                    Some((data, mode)) => Event::Command(data, mode),
+                    None => break,
+                },
+                reply = replies.recv() => match reply {
+                    Some((id, data)) => Event::Reply(id, data),
+                    None => break,
+                },
+                _ = interval.tick() => Event::Tick,
             };
-
-            let assoc = {
-                let mut map = assocs.lock().await;
-                if let Some(a) = map.get(&assoc_id) {
-                    a.clone()
-                } else {
-                    // New assoc_id: bind a fresh, unconnected (full‑cone) socket.
-                    let sock = match UdpSocket::bind("0.0.0.0:0").await {
-                        Ok(s) => Arc::new(s),
-                        Err(e) => {
-                            warn!("[TUIC server] failed to bind assoc socket: {e}");
-                            return;
+            match event {
+                Event::Tick => {
+                    let stale: Vec<_> = assocs.iter()
+                        .filter(|(_, assoc)| assoc._pump.is_finished()
+                            || (assoc.last_seen.elapsed() >= ASSOC_TIMEOUT
+                                && assoc.last_reply_activity.lock().map(|seen| seen.elapsed() >= ASSOC_TIMEOUT).unwrap_or(false)))
+                        .map(|(&id, _)| id).collect();
+                    for id in stale {
+                        retired[id as usize] = true;
+                        assocs.remove(&id);
+                        // Tell the client to retire its matching mapping too;
+                        // otherwise its next packet could refresh a dead ID.
+                        send_command(conn, &[TYPE_DISSOCIATE, (id >> 8) as u8, id as u8]).await?;
+                    }
+                    for assoc in assocs.values_mut() { assoc.reassembly.cleanup(); }
+                }
+                Event::Reply(id, data) => {
+                    if let Some(assoc) = assocs.get_mut(&id) {
+                        // Downstream traffic is activity too (subscriptions,
+                        // streaming replies and full-cone traffic).
+                        assoc.last_seen = Instant::now();
+                        // Do not reuse a 16-bit packet ID while an old
+                        // fragmented packet may still be awaiting reassembly.
+                        if assoc.next_packet > u16::MAX as u32 {
+                            if Instant::now() < assoc.next_packet_wrap { continue; }
+                            assoc.next_packet = 0;
+                            assoc.next_packet_wrap = Instant::now() + REASSEMBLY_TIMEOUT;
                         }
-                    };
-                    let assoc = Arc::new(ServerAssoc::new(sock.clone(), from_mode));
-                    map.insert(assoc_id, assoc.clone());
-
-                    // Spawn the reply pump.  This task lives as long as the
-                    // assoc; it reads replies from `sock` and relays them
-                    // back to the client in the same transport mode the
-                    // client used.  The JoinHandle is stored so the task can
-                    // be aborted on Dissociate (matching upstream TUIC).
-                    let conn2 = conn.clone();
-                    let pkt_id_ctr2 = pkt_id_ctr.clone();
-                    let assocs2 = assocs.clone();
-                    let assoc_for_pump = assoc.clone();
-                    let reply_handle = tokio::spawn(async move {
-                        // Snapshot the datagram limit once — it is
-                        // stable after the QUIC handshake settles.
-                        let max_payload = datagram_payload_limit(&conn2);
-                        let mut buf = vec![0u8; 65536];
-                        loop {
-                            match sock.recv_from(&mut buf).await {
-                                Ok((n, _from)) => {
-                                    let mode =
-                                        assoc_for_pump.state.lock().await.mode;
-                                    let id = pkt_id_ctr2
-                                        .fetch_add(1, Ordering::Relaxed);
-                                    let frames = build_packet_maybe_fragmented(
-                                        assoc_id, id, &buf[..n], max_payload,
-                                    );
-                                    let mut ok = true;
-                                    for pkt in frames {
-                                        if !send_packet_reply(
-                                            &conn2, pkt, mode,
-                                        )
-                                        .await
-                                        {
-                                            ok = false;
-                                            break;
+                        let packet_id = assoc.next_packet as u16;
+                        assoc.next_packet += 1;
+                        send_packet(conn, id, packet_id, &data, assoc.mode).await?;
+                    }
+                }
+                Event::Command(data, mode) => {
+                    match data.first().copied() {
+                        Some(TYPE_PACKET) => {
+                            let packet = parse_packet(&data).context("invalid UDP packet")?;
+                            if retired[packet.assoc as usize] { continue; }
+                            if !assocs.contains_key(&packet.assoc) {
+                                if assocs.len() >= MAX_ASSOCIATIONS { continue; }
+                                let permit = match resources.socket() { Ok(permit) => permit, Err(_) => continue };
+                                let socket = Arc::new(UdpSocket::bind(runtime::unspecified_for(remote)).await?);
+                                let pump_socket = socket.clone();
+                                let tx = reply_tx.clone();
+                                let id = packet.assoc;
+                                let last_reply_activity = Arc::new(std::sync::Mutex::new(Instant::now()));
+                                let pump_activity = last_reply_activity.clone();
+                                let pump = Task::spawn(async move {
+                                    let mut buf = vec![0; 65_536];
+                                    loop {
+                                        match pump_socket.recv_from(&mut buf).await {
+                                            Ok((len, _)) if len <= MAX_UDP_PAYLOAD => {
+                                                if let Ok(mut seen) = pump_activity.lock() { *seen = Instant::now(); }
+                                                if !matches!(tokio::time::timeout(IO_TIMEOUT,
+                                                    tx.send((id, buf[..len].to_vec()))).await, Ok(Ok(()))) { break; }
+                                            }
+                                            Ok(_) => {}
+                                            Err(_) => break,
                                         }
                                     }
-                                    if !ok {
-                                        break;
-                                    }
+                                });
+                                assocs.insert(id, ServerAssoc {
+                                    socket,
+                                    mode,
+                                    last_seen: Instant::now(),
+                                    reassembly: Reassembly::default(),
+                                    last_reply_activity,
+                                    next_packet: 0,
+                                    next_packet_wrap: Instant::now() + REASSEMBLY_TIMEOUT,
+                                    _pump: pump,
+                                    _permit: permit,
+                                });
+                            }
+                            if let Some(assoc) = assocs.get_mut(&packet.assoc) {
+                                assoc.mode = mode;
+                                assoc.last_seen = Instant::now();
+                                if let Some(payload) = assoc.reassembly.insert(&packet, &resources) {
+                                    tokio::time::timeout(IO_TIMEOUT, assoc.socket.send_to(&payload, remote)).await??;
                                 }
-                                Err(_) => break,
                             }
                         }
-                        assocs2.lock().await.remove(&assoc_id);
-                    });
-                    *assoc.reply_handle.lock().await = Some(reply_handle);
-
-                    assoc
-                }
-            };
-
-            // Single lock for both mode + last_seen (hot‑path optimisation).
-            {
-                let mut state = assoc.state.lock().await;
-                state.mode = from_mode;
-                state.last_seen = Instant::now();
-            }
-
-            // ── Reassembly ────────────────────────────────────────────
-            if frag_total == 1 {
-                // Fast path: single fragment, forward immediately.
-                if let Err(e) = assoc.sock.send_to(payload, remote).await {
-                    warn!("[TUIC server] assoc {assoc_id} send to remote failed: {e}");
-                }
-            } else {
-                let mut reassembly = assoc.reassembly.lock().await;
-
-                // If a buffer already exists for this pkt_id but with a
-                // different fragment total, the pkt_id has wrapped around
-                // and the new packet replaces the old incomplete one
-                // (matching sing‑quic's
-                //  `if int(m.fragmentTotal) != len(item.messages)` reset).
-                if let Some(existing) = reassembly.get(&pkt_id) {
-                    if existing.total != frag_total {
-                        reassembly.remove(&pkt_id);
-                    }
-                }
-
-                // Enforce per‑assoc cap on in‑flight reassembly buffers
-                // (matching upstream TUIC's defensive bound).  When at
-                // capacity the oldest incomplete buffer is evicted.
-                if reassembly.len() >= MAX_REASSEMBLY_BUFFERS
-                    && !reassembly.contains_key(&pkt_id)
-                {
-                    if let Some(oldest_key) = reassembly
-                        .iter()
-                        .min_by_key(|(_, buf)| buf.created)
-                        .map(|(k, _)| *k)
-                    {
-                        reassembly.remove(&oldest_key);
-                        debug!(
-                            "[TUIC server] evicted stale reassembly buffer pkt_id={oldest_key}"
-                        );
-                    }
-                }
-                let entry = reassembly
-                    .entry(pkt_id)
-                    .or_insert_with(|| ReassemblyBuffer::new(frag_total));
-                if entry.insert(frag_id, payload) {
-                    // All fragments received — assemble and forward.
-                    let complete = reassembly
-                        .remove(&pkt_id)
-                        .unwrap()
-                        .assemble();
-                    drop(reassembly);
-                    if let Err(e) = assoc.sock.send_to(&complete, remote).await {
-                        warn!("[TUIC server] assoc {assoc_id} send to remote failed: {e}");
+                        Some(TYPE_DISSOCIATE) if data.len() == 3 => {
+                            let id = u16::from_be_bytes([data[1], data[2]]);
+                            retired[id as usize] = true;
+                            assocs.remove(&id);
+                        }
+                        Some(TYPE_HEARTBEAT) if data.len() == 1 => {}
+                        _ => return Err(anyhow!("invalid QUIC command")),
                     }
                 }
             }
         }
-
-        TYPE_DISSOCIATE => {
-            if cmd_data.len() >= 3 {
-                let assoc_id = u16::from_be_bytes([cmd_data[1], cmd_data[2]]);
-                if let Some(assoc) = assocs.lock().await.remove(&assoc_id) {
-                    // Abort the reply pump so that its UDP socket is closed
-                    // promptly — matching upstream TUIC's cleanup on
-                    // Dissociate.
-                    if let Some(handle) = assoc.reply_handle.lock().await.take() {
-                        handle.abort();
-                    }
-                }
-                // dissociate handled
-            }
-        }
-
-        TYPE_HEARTBEAT => {
-            // heartbeat — silent (fires every 10 s per connection)
-        }
-
-        other => {
-            warn!("[TUIC server] unknown command type {other} (mode={from_mode:?})");
-        }
-    }
+        Ok(())
+    }.await;
+    assocs.clear(); // Drop aborts every owned reply pump, no Arc cycles.
+    command_task.stop().await;
+    result
 }
 
-// ── Datagram receive loop ───────────────────────────────────────────────────
-
-async fn run_datagram_loop(
-    conn: &Connection,
-    assocs: Arc<Mutex<HashMap<u16, Arc<ServerAssoc>>>>,
-    remote: Arc<String>,
-    pkt_id_ctr: &Arc<AtomicU16>,
-) -> anyhow::Result<()> {
-    loop {
-        let dgram = match conn.read_datagram().await {
-            Ok(d) => d,
-            Err(e) => return Err(anyhow::anyhow!("read_datagram: {e}")),
-        };
-        dispatch_command(&dgram, RelayMode::Datagram, &assocs, &remote, conn, pkt_id_ctr)
-            .await;
-    }
+struct ClientAssoc {
+    peer: SocketAddr,
+    last_seen: Instant,
+    next_packet: u32,
+    next_packet_wrap: Instant,
+    reassembly: Reassembly,
 }
 
-// ── Unidirectional‑stream receive loop ──────────────────────────────────────
-
-async fn run_stream_loop(
-    conn: &Connection,
-    assocs: Arc<Mutex<HashMap<u16, Arc<ServerAssoc>>>>,
-    remote: Arc<String>,
-    pkt_id_ctr: &Arc<AtomicU16>,
-) -> anyhow::Result<()> {
-    loop {
-        let mut stream = conn.accept_uni().await?;
-        // Each TUIC command arrives on its own stream.  read_to_end gathers
-        // the complete frame.
-        let data = match stream
-            .read_to_end(65536)
-            .await
-            .map_err(|e| anyhow::anyhow!("stream read: {e}"))
-        {
-            Ok(d) => d,
-            Err(e) => {
-                warn!("[TUIC server] stream read error: {e}");
-                continue;
-            }
-        };
-        dispatch_command(&data, RelayMode::Stream, &assocs, &remote, conn, pkt_id_ctr)
-            .await;
-    }
+fn local_association(
+    peer: SocketAddr,
+    peers: &mut HashMap<SocketAddr, u16>,
+    assocs: &mut HashMap<u16, ClientAssoc>,
+    next_id: &mut u32,
+) -> Result<Option<u16>> {
+    if let Some(id) = peers.get(&peer) { return Ok(Some(*id)); }
+    if assocs.len() >= MAX_ASSOCIATIONS { return Ok(None); }
+    let id = u16::try_from(*next_id).context("association IDs exhausted; reconnecting")?;
+    *next_id += 1;
+    peers.insert(peer, id);
+    assocs.insert(id, ClientAssoc {
+        peer,
+        last_seen: Instant::now(),
+        next_packet: 0,
+        next_packet_wrap: Instant::now() + REASSEMBLY_TIMEOUT,
+        reassembly: Reassembly::default(),
+    });
+    Ok(Some(id))
 }
 
-// ── Client ──────────────────────────────────────────────────────────────────
-
-pub async fn run_udp_client(config: &TunnelConfig) -> anyhow::Result<()> {
-    let local = Arc::new(
-        UdpSocket::bind(&config.listen)
-            .await
-            .with_context(|| format!("failed to bind UDP listen address {}", config.listen))?,
-    );
-    info!("[TUIC client] listening on {} (plain UDP)", config.listen);
-
-    let remote_host = config.default_remote()?;
-    let password = config.default_password()?;
-
-    let sni = if config.sni.is_empty() {
-        remote_host
-            .rsplit_once(':')
-            .map(|(h, _)| h.to_string())
-            .unwrap_or_default()
-    } else {
-        config.sni.clone()
-    };
-
-    // Reconnection loop: if the QUIC connection drops (timeout, network
-    // blip, server restart) we retry with exponential backoff instead of
-    // dying permanently.
-    let mut retry_delay = Duration::from_secs(1);
-    const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
-
+pub async fn run_udp_client(cfg: &TunnelConfig, resources: Resources, shutdown: Shutdown) -> Result<()> {
+    let _local_permit = resources.socket()?;
+    let local = UdpSocket::bind(&cfg.listen).await.context("bind UDP listener")?;
+    let remote = cfg.default_remote()?;
+    let sni = cfg.server_name()?;
+    let password = cfg.default_password()?;
+    // Trust roots and QUIC configuration are cached across reconnections.
+    let quic = tls::build_quic_client_config(tls::build_rustls_client_config(cfg.insecure)?)?;
+    let mut delay = Duration::from_secs(1);
+    tracing::info!("[TUIC client] listening on {}", cfg.listen);
     loop {
-        // Re‑resolve DNS each attempt (the server IP may have changed).
-        let remote_addr: SocketAddr = match tokio::net::lookup_host(&remote_host).await {
-            Ok(mut addrs) => match addrs.next() {
-                Some(a) => a,
-                None => {
-                    tracing::warn!(
-                        "[TUIC client] DNS resolved no addresses for {remote_host}, retrying in {}s ...",
-                        retry_delay.as_secs()
-                    );
-                    tokio::time::sleep(retry_delay).await;
-                    retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
-                    continue;
-                }
-            },
-            Err(e) => {
-                tracing::warn!(
-                    "[TUIC client] DNS resolve failed for {remote_host}: {e}, retrying in {}s ...",
-                    retry_delay.as_secs()
-                );
-                tokio::time::sleep(retry_delay).await;
-                retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
-                continue;
-            }
+        let result = tokio::select! {
+            _ = shutdown.cancelled() => return Ok(()),
+            result = async {
+                let _endpoint_permit = resources.socket()?;
+                let (endpoint, conn) = connect_quic(&remote, &sni, &quic).await?;
+                let connected_at = Instant::now();
+                let result = async {
+                    let uuid = derive_uuid(&password);
+                    let token = derive_token(&conn, &uuid, &password)?;
+                    let mut auth = Vec::with_capacity(AUTH_LEN);
+                    auth.extend_from_slice(&[TUIC_VERSION, TYPE_AUTHENTICATE]);
+                    auth.extend_from_slice(&uuid);
+                    auth.extend_from_slice(&token);
+                    send_command(&conn, &auth).await?;
+                    // A sent auth command is not proof the server accepted it.
+                    tracing::info!("[TUIC client] QUIC connected; authentication sent");
+                    client_relay(&local, &conn, &resources, &shutdown).await
+                }.await;
+                let stable = connected_at.elapsed() >= Duration::from_secs(30);
+                conn.close(VarInt::from_u32(0), b"relay ended");
+                endpoint.close(VarInt::from_u32(0), b"relay ended");
+                let _ = tokio::time::timeout(IO_TIMEOUT, endpoint.wait_idle()).await;
+                if stable { delay = Duration::from_secs(1); }
+                result
+            } => result,
         };
-
-        let rustls_cfg = tls::build_rustls_client_config(config.insecure);
-        let quic_client_cfg = match tls::build_quic_client_config(rustls_cfg) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("[TUIC client] failed to build QUIC config: {e}");
-                tokio::time::sleep(retry_delay).await;
-                retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
-                continue;
-            }
-        };
-        let mut endpoint = match quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()) {
-            Ok(ep) => ep,
-            Err(e) => {
-                tracing::warn!("[TUIC client] failed to create QUIC endpoint: {e}");
-                tokio::time::sleep(retry_delay).await;
-                retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
-                continue;
-            }
-        };
-        endpoint.set_default_client_config(quic_client_cfg);
-
-        tracing::info!("[TUIC client] connecting QUIC to {remote_addr} (sni={sni}) ...");
-        let conn = match tokio::time::timeout(Duration::from_secs(10), async {
-            endpoint
-                .connect(remote_addr, &sni)?
-                .await
-                .map_err(anyhow::Error::from)
-        })
-        .await
-        {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    "[TUIC client] QUIC connect to {remote_addr} failed: {e}, retrying in {}s ...",
-                    retry_delay.as_secs()
-                );
-                tokio::time::sleep(retry_delay).await;
-                retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
-                continue;
-            }
-            Err(_elapsed) => {
-                tracing::warn!(
-                    "[TUIC client] QUIC connect to {remote_addr} timed out, retrying in {}s ...",
-                    retry_delay.as_secs()
-                );
-                tokio::time::sleep(retry_delay).await;
-                retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
-                continue;
-            }
-        };
-
-        // ── Authenticate (0‑RTT) ────────────────────────────────────────
-        let uuid = derive_uuid(&password);
-        let token = match derive_token(&conn, &uuid, &password) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!("[TUIC client] token derivation failed: {e}, retrying ...");
-                tokio::time::sleep(retry_delay).await;
-                retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
-                continue;
-            }
-        };
-        {
-            let mut s = match conn.open_uni().await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("[TUIC client] failed to open auth stream: {e}, retrying ...");
-                    tokio::time::sleep(retry_delay).await;
-                    retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
-                    continue;
-                }
-            };
-            if let Err(e) = s.write_all(&build_authenticate(&uuid, &token)).await {
-                tracing::warn!("[TUIC client] failed to write Authenticate: {e}, retrying ...");
-                tokio::time::sleep(retry_delay).await;
-                retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
-                continue;
-            }
-            if let Err(e) = s.finish() {
-                tracing::warn!("[TUIC client] failed to finish auth stream: {e}, retrying ...");
-                tokio::time::sleep(retry_delay).await;
-                retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
-                continue;
-            }
-        }
-        tracing::info!("[TUIC client] QUIC connected to {remote_addr}, auth ok");
-
-        // Successful connection — reset backoff.
-        retry_delay = Duration::from_secs(1);
-
-        let assoc_id: u16 = 1;
-        let pkt_id_ctr = Arc::new(AtomicU16::new(0));
-        let conn = Arc::new(conn);
-
-        let relay_mode = RelayMode::Datagram;
-        let last_peer: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
-
-        // Heartbeat: keep NAT/QUIC‑path state alive.
-        let heartbeat_handle = {
-            let conn2 = conn.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(HEARTBEAT_INTERVAL).await;
-                    if conn2
-                        .send_datagram(Bytes::from(build_heartbeat()))
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            })
-        };
-
-        let mut l2q = tokio::spawn(local_udp_to_quic(
-            local.clone(),
-            conn.clone(),
-            assoc_id,
-            pkt_id_ctr.clone(),
-            last_peer.clone(),
-            relay_mode,
-        ));
-        let mut q2l = tokio::spawn(quic_to_local_udp(
-            local.clone(),
-            conn.clone(),
-            assoc_id,
-            last_peer,
-        ));
-
-        // Whichever direction ends first brings the other one down.
+        if shutdown.is_cancelled() { return Ok(()); }
+        tracing::warn!("[TUIC client] relay ended: {}; retrying in {}s",
+            result.err().map(|e| format!("{e:#}")).unwrap_or_else(|| "connection closed".into()), delay.as_secs());
         tokio::select! {
-            _ = &mut l2q => { q2l.abort(); }
-            _ = &mut q2l => { l2q.abort(); }
+            _ = shutdown.cancelled() => return Ok(()),
+            _ = tokio::time::sleep(delay) => {}
         }
-        heartbeat_handle.abort();
-
-        // Best‑effort Dissociate on the way out.
-        if let Ok(mut s) = conn.open_uni().await {
-            let _ = s.write_all(&build_dissociate(assoc_id)).await;
-            let _ = s.finish();
-        }
-
-        tracing::warn!(
-            "[TUIC client] relay ended, reconnecting in {}s ...",
-            retry_delay.as_secs()
-        );
-        tokio::time::sleep(retry_delay).await;
-        retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
+        delay = (delay * 2).min(Duration::from_secs(60));
     }
 }
 
-/// local UDP recv → wrap as Packet(s) → send via QUIC (datagram or stream).
-/// Also records the sender's address into `last_peer` so the reply path knows
-/// where to write QUIC‑side responses back to.
-async fn local_udp_to_quic(
-    local: Arc<UdpSocket>,
-    conn: Arc<Connection>,
-    assoc_id: u16,
-    pkt_id_ctr: Arc<AtomicU16>,
-    last_peer: Arc<Mutex<Option<SocketAddr>>>,
-    relay_mode: RelayMode,
-) {
-    // Snapshot once — stable after QUIC handshake.
-    let max_payload = datagram_payload_limit(&conn);
-    let mut buf = vec![0u8; 65536];
-    loop {
-        let (n, peer) = match local.recv_from(&mut buf).await {
-            Ok(v) => v,
-            Err(_) => break,
-        };
-        *last_peer.lock().await = Some(peer);
-        let id = pkt_id_ctr.fetch_add(1, Ordering::Relaxed);
-
-        // Fragment oversized payloads using the runtime datagram limit.
-        let frames = build_packet_maybe_fragmented(assoc_id, id, &buf[..n], max_payload);
-
-        match relay_mode {
-            RelayMode::Datagram => {
-                for pkt in frames {
-                    if let Err(e) = conn.send_datagram(Bytes::from(pkt)) {
-                        warn!("[TUIC client] send_datagram error: {e}");
-                    }
-                }
-            }
-            RelayMode::Stream => {
-                for pkt in frames {
-                    match conn.open_uni().await {
-                        Ok(mut s) => {
-                            if let Err(e) = s.write_all(&pkt).await {
-                                warn!("[TUIC client] stream write error: {e}");
-                                return;
-                            }
-                            if let Err(e) = s.finish() {
-                                warn!("[TUIC client] stream finish error: {e}");
-                                return;
-                            }
-                        }
-                        Err(e) => {
-                            warn!("[TUIC client] open_uni error: {e}");
-                            return;
-                        }
-                    }
-                }
-            }
+async fn connect_quic(remote: &str, sni: &str, config: &quinn::ClientConfig) -> Result<(quinn::Endpoint, Connection)> {
+    let addrs = runtime::resolve(remote).await?;
+    let mut last_error = anyhow!("no reachable QUIC address");
+    for addr in addrs {
+        let attempt: Result<(quinn::Endpoint, Connection)> = async {
+            let mut endpoint = quinn::Endpoint::client(runtime::unspecified_for(addr))?;
+            endpoint.set_default_client_config(config.clone());
+            let conn = tokio::time::timeout(IO_TIMEOUT, endpoint.connect(addr, sni)?)
+                .await.context("QUIC connect timed out")??;
+            Ok((endpoint, conn))
+        }.await;
+        match attempt {
+            Ok(connection) => return Ok(connection),
+            Err(e) => last_error = e,
         }
     }
+    Err(last_error)
 }
 
-/// Processes one incoming Packet command on the client side, handling
-/// fragment reassembly when the server sends multi‑fragment replies.
-async fn handle_client_packet(
-    data: &[u8],
-    assoc_id: u16,
-    reassembly: &mut HashMap<u16, ReassemblyBuffer>,
-    last_peer: &Arc<Mutex<Option<SocketAddr>>>,
-    local: &UdpSocket,
-) {
-    let Some((recv_assoc, pkt_id, frag_total, frag_id, payload)) = parse_packet(data) else {
-        warn!("[TUIC client] malformed Packet ({} bytes)", data.len());
-        return;
-    };
-    if recv_assoc != assoc_id {
-        return;
-    }
-
-    if frag_total == 1 {
-        // Fast path: single fragment, forward immediately.
-        let peer = *last_peer.lock().await;
-        if let Some(peer) = peer {
-            if let Err(e) = local.send_to(payload, peer).await {
-                warn!("[TUIC client] send_to {peer} error: {e}");
-            }
+async fn client_relay(local: &UdpSocket, conn: &Connection, resources: &Resources, shutdown: &Shutdown) -> Result<()> {
+    let mut peers: HashMap<SocketAddr, u16> = HashMap::new();
+    let mut assocs: HashMap<u16, ClientAssoc> = HashMap::new();
+    // Never reuse IDs while delayed datagrams from old associations can arrive.
+    // Reconnect when the finite wire ID space is exhausted.
+    let mut next_assoc = 1u32;
+    let (command_tx, mut commands) = mpsc::channel(COMMAND_QUEUE);
+    let stream_conn = conn.clone();
+    let mut command_task = Task::spawn(async move {
+        if read_commands(stream_conn.clone(), command_tx).await.is_err() {
+            stream_conn.close(VarInt::from_u32(ERROR_PROTOCOL), b"command reader failed");
         }
-    } else {
-        // pkt_id wrap‑around guard: if the new fragment's total differs
-        // from the existing buffer, reset it (matching sing‑quic).
-        if let Some(existing) = reassembly.get(&pkt_id) {
-            if existing.total != frag_total {
-                reassembly.remove(&pkt_id);
-            }
-        }
-
-        // Enforce per‑client cap on in‑flight reassembly buffers so a
-        // malicious server cannot exhaust client memory by sending fragments
-        // that will never complete.
-        if reassembly.len() >= MAX_REASSEMBLY_BUFFERS && !reassembly.contains_key(&pkt_id) {
-            if let Some(oldest_key) = reassembly
-                .iter()
-                .min_by_key(|(_, buf)| buf.created)
-                .map(|(k, _)| *k)
-            {
-                reassembly.remove(&oldest_key);
-            }
-        }
-        let entry = reassembly
-            .entry(pkt_id)
-            .or_insert_with(|| ReassemblyBuffer::new(frag_total));
-        if entry.insert(frag_id, payload) {
-            // All fragments received — assemble and forward to the local
-            // UDP socket.
-            let complete = reassembly.remove(&pkt_id).unwrap().assemble();
-            let peer = *last_peer.lock().await;
-            if let Some(peer) = peer {
-                if let Err(e) = local.send_to(&complete, peer).await {
-                    warn!("[TUIC client] send_to {peer} error: {e}");
+    });
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    let mut janitor = tokio::time::interval(Duration::from_secs(5));
+    let mut buf = vec![0; 65_536];
+    let result: Result<()> = async {
+        loop {
+            enum Event { Local(usize, SocketAddr), Reply(Vec<u8>), Tick, Heartbeat }
+            let event = tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = conn.closed() => break,
+                result = local.recv_from(&mut buf) => { let (len, peer) = result?; Event::Local(len, peer) },
+                result = conn.read_datagram() => Event::Reply(result?.to_vec()),
+                result = commands.recv() => match result { Some((data, _)) => Event::Reply(data), None => break },
+                _ = janitor.tick() => Event::Tick,
+                _ = heartbeat.tick() => Event::Heartbeat,
+            };
+            match event {
+                Event::Local(len, peer) => {
+                    if len > MAX_UDP_PAYLOAD { continue; }
+                    let Some(id) = local_association(peer, &mut peers, &mut assocs, &mut next_assoc)? else {
+                        continue;
+                    };
+                    if let Some(assoc) = assocs.get_mut(&id) {
+                        assoc.last_seen = Instant::now();
+                        if assoc.next_packet > u16::MAX as u32 {
+                            if Instant::now() < assoc.next_packet_wrap { continue; }
+                            assoc.next_packet = 0;
+                            assoc.next_packet_wrap = Instant::now() + REASSEMBLY_TIMEOUT;
+                        }
+                        let packet = assoc.next_packet as u16;
+                        assoc.next_packet += 1;
+                        send_packet(conn, id, packet, &buf[..len], RelayMode::Datagram).await?;
+                    }
+                }
+                Event::Reply(data) => {
+                    if data.as_slice() == [TYPE_HEARTBEAT] { continue; }
+                    if data.len() == 3 && data[0] == TYPE_DISSOCIATE {
+                        let id = u16::from_be_bytes([data[1], data[2]]);
+                        if let Some(assoc) = assocs.remove(&id) { peers.remove(&assoc.peer); }
+                        continue;
+                    }
+                    let packet = parse_packet(&data).context("invalid reply packet")?;
+                    if let Some(assoc) = assocs.get_mut(&packet.assoc) {
+                        assoc.last_seen = Instant::now();
+                        if let Some(payload) = assoc.reassembly.insert(&packet, resources) {
+                            tokio::time::timeout(IO_TIMEOUT, local.send_to(&payload, assoc.peer)).await??;
+                        }
+                    }
+                }
+                Event::Heartbeat => {
+                    if conn.send_datagram(Bytes::from_static(&[TYPE_HEARTBEAT])).is_err()
+                        && conn.close_reason().is_some() { break; }
+                }
+                Event::Tick => {
+                    let stale: Vec<_> = assocs.iter().filter(|(_, assoc)| assoc.last_seen.elapsed() >= ASSOC_TIMEOUT)
+                        .map(|(&id, _)| id).collect();
+                    for id in stale {
+                        if let Some(assoc) = assocs.remove(&id) { peers.remove(&assoc.peer); }
+                        let frame = [TYPE_DISSOCIATE, (id >> 8) as u8, id as u8];
+                        send_command(conn, &frame).await?;
+                    }
+                    for assoc in assocs.values_mut() { assoc.reassembly.cleanup(); }
                 }
             }
         }
-    }
+        Ok(())
+    }.await;
+    command_task.stop().await;
+    result
 }
 
-/// QUIC → local UDP: reads Packet replies from whichever channel the server
-/// is using (datagram or unidirectional stream) and writes them back to the
-/// most‑recently‑seen local peer.  Fragmented replies from the server are
-/// reassembled before delivery.
-async fn quic_to_local_udp(
-    local: Arc<UdpSocket>,
-    conn: Arc<Connection>,
-    assoc_id: u16,
-    last_peer: Arc<Mutex<Option<SocketAddr>>>,
-) {
-    let mut reassembly: HashMap<u16, ReassemblyBuffer> = HashMap::new();
-    let mut last_cleanup = Instant::now();
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    loop {
-        // Periodically evict stale reassembly buffers (same timeout the
-        // server uses, matching upstream TUIC).
-        if last_cleanup.elapsed() > REASSEMBLY_TIMEOUT / 2 {
-            reassembly.retain(|_, buf| !buf.is_stale());
-            last_cleanup = Instant::now();
+    #[test]
+    fn fragmented_packets_reassemble_and_release_budget() {
+        let resources = Resources::new();
+        let data = vec![42; MAX_UDP_PAYLOAD];
+        let frames = packet_frames(1, 7, &data, 1100).unwrap();
+        let mut reassembly = Reassembly::default();
+        let mut result = None;
+        for frame in frames.iter().rev() {
+            result = reassembly.insert(&parse_packet(frame).unwrap(), &resources).or(result);
         }
+        assert_eq!(result.unwrap(), data);
+        assert!(reassembly.packets.is_empty());
+    }
 
-        // Accept from either transport — the server mirrors the client's
-        // mode, and Heartbeat responses always come as datagrams.
-        tokio::select! {
-            dgram_res = conn.read_datagram() => {
-                match dgram_res {
-                    Ok(dgram) => {
-                        if dgram.is_empty() {
-                            continue;
-                        }
-                        match dgram[0] {
-                            TYPE_PACKET => {
-                                handle_client_packet(
-                                    &dgram, assoc_id, &mut reassembly,
-                                    &last_peer, &local,
-                                ).await;
-                            }
-                            TYPE_HEARTBEAT => {
-                                // heartbeat ack — silent
-                            }
-                            other => {
-                                warn!("[TUIC client] unknown datagram type {other}");
-                            }
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-            stream_res = conn.accept_uni() => {
-                match stream_res {
-                    Ok(mut stream) => {
-                        let data = match stream.read_to_end(65536).await {
-                            Ok(d) => d,
-                            Err(e) => {
-                                warn!("[TUIC client] stream read error: {e}");
-                                continue;
-                            }
-                        };
-                        if data.is_empty() {
-                            continue;
-                        }
-                        match data[0] {
-                            TYPE_PACKET => {
-                                handle_client_packet(
-                                    &data, assoc_id, &mut reassembly,
-                                    &last_peer, &local,
-                                ).await;
-                            }
-                            TYPE_HEARTBEAT => {
-                                // heartbeat ack — silent
-                            }
-                            other => {
-                                warn!("[TUIC client] unknown stream type {other}");
-                            }
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
+    #[test]
+    fn invalid_fragment_limits_and_address_tags_are_rejected() {
+        assert!(packet_frames(1, 0, &[1], 0).is_err());
+        assert!(packet_frames(1, 0, &[1; 256], 1).is_err());
+        assert!(packet_frames(1, 0, &vec![0; MAX_UDP_PAYLOAD + 1], 1100).is_err());
+        let mut frame = packet_frames(1, 0, b"data", 1100).unwrap().remove(0);
+        frame[9] = 0;
+        assert!(parse_packet(&frame).is_none());
+    }
+
+    #[test]
+    fn different_local_peers_get_independent_reply_routes() {
+        let a: SocketAddr = "127.0.0.1:1001".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:1002".parse().unwrap();
+        let mut peers = HashMap::new();
+        let mut assocs = HashMap::new();
+        let mut next_id = 1;
+        let id_a = local_association(a, &mut peers, &mut assocs, &mut next_id).unwrap().unwrap();
+        let id_b = local_association(b, &mut peers, &mut assocs, &mut next_id).unwrap().unwrap();
+        assert_ne!(id_a, id_b);
+        assert_eq!(assocs[&id_a].peer, a);
+        assert_eq!(assocs[&id_b].peer, b);
+        assert_eq!(local_association(a, &mut peers, &mut assocs, &mut next_id).unwrap(), Some(id_a));
+        assocs.remove(&id_a);
+        peers.remove(&a);
+        let id_new = local_association(a, &mut peers, &mut assocs, &mut next_id).unwrap().unwrap();
+        assert_ne!(id_new, id_a);
+        assert!(!assocs.contains_key(&id_a));
+    }
+
+    #[test]
+    fn association_reassembly_is_isolated() {
+        let resources = Resources::new();
+        let a = packet_frames(1, 5, b"abcdef", 3).unwrap();
+        let b = packet_frames(2, 5, b"uvwxyz", 3).unwrap();
+        let mut associations = HashMap::from([(1, Reassembly::default()), (2, Reassembly::default())]);
+        for frame in [&a[0], &b[0]] {
+            let packet = parse_packet(frame).unwrap();
+            assert!(associations.get_mut(&packet.assoc).unwrap().insert(&packet, &resources).is_none());
+        }
+        for (frame, expected) in [(&a[1], b"abcdef"), (&b[1], b"uvwxyz")] {
+            let packet = parse_packet(frame).unwrap();
+            assert_eq!(associations.get_mut(&packet.assoc).unwrap().insert(&packet, &resources).unwrap(), expected);
         }
     }
 }

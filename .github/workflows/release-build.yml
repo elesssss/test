@@ -1,6 +1,12 @@
 name: Build and Release
 
 on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/release-build.yml'
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+*'
@@ -8,6 +14,12 @@ on:
       - main
     paths:
       - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'src/**'
+      - 'anyst.service'
+      - 'anyst.sysusers'
+      - 'config.example.yaml'
+      - '.github/workflows/release-build.yml'
   workflow_dispatch:
     inputs:
       version:
@@ -23,9 +35,26 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Validate source changes even when no new release version is requested.
+  checks:
+    name: Source checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Lint Rust
+        run: cargo clippy --locked --all-targets
+      - name: Regression tests
+        run: cargo test --locked --all-targets
+
   # ── 版本信息准备 job ─────────────────────────────────────────────
   prepare:
     name: Prepare release
+    needs: checks
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.VERSION }}
@@ -41,10 +70,16 @@ jobs:
 
       - name: Determine version
         id: version
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "VERSION=${{ inputs.version }}" >> $GITHUB_OUTPUT
-            echo "TAG_NAME=v${{ inputs.version }}" >> $GITHUB_OUTPUT
+            if ! [[ "$REQUESTED_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+              printf 'Invalid release version\n' >&2
+              exit 1
+            fi
+            echo "VERSION=$REQUESTED_VERSION" >> "$GITHUB_OUTPUT"
+            echo "TAG_NAME=v$REQUESTED_VERSION" >> "$GITHUB_OUTPUT"
             echo "IS_TAG_PUSH=false" >> $GITHUB_OUTPUT
             echo "SHOULD_BUILD=true" >> $GITHUB_OUTPUT
 
@@ -106,8 +141,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Verify Cargo.toml version (tag push only)
-        if: steps.version.outputs.IS_TAG_PUSH == 'true'
+      - name: Verify Cargo.toml version
+        if: steps.version.outputs.SHOULD_BUILD == 'true'
         run: |
           CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
           TAG_VERSION="${{ steps.version.outputs.VERSION }}"
@@ -161,7 +196,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build
-        run: cross build --target ${{ matrix.target }} --release
+        run: cross build --locked --target ${{ matrix.target }} --release
 
       - name: Package
         run: |
@@ -174,6 +209,8 @@ jobs:
           cp target/${{ matrix.target }}/release/${BIN_NAME} "${PKG_DIR}/"
           [ -f "config.example.yaml" ] && cp config.example.yaml "${PKG_DIR}/" || true
           [ -f "anyst.service" ] && cp anyst.service "${PKG_DIR}/" || true
+          cp anyst.sysusers "${PKG_DIR}/"
+          cp README.md "${PKG_DIR}/"
           [ -f "anyst.sh" ] && cp anyst.sh "${PKG_DIR}/" || true
           
           PKG_FILE="${BIN_NAME}-${{ matrix.target }}-v${VERSION}.tar.gz"
