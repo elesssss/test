@@ -38,7 +38,10 @@ cd s-ui
 git submodule update --init --recursive
 ```
 
-The **frontend** lives in a submodule. If you only work on the backend, you can use the existing `web/html` contents or build the frontend once (see below).
+In this fork, **frontend/** is an ordinary tracked source directory. The historical
+`.gitmodules` entry is not a gitlink; do not replace the directory with a submodule.
+Build its assets into `web/html` before running the panel; that generated directory
+is ignored and may be absent in a fresh checkout.
 
 ### Backend-Only Development (quickest)
 
@@ -61,11 +64,11 @@ The **frontend** lives in a submodule. If you only work on the backend, you can 
 
 ### Full Stack (Backend + Frontend)
 
-1. **Frontend** (separate repo in submodule):
+1. **Frontend** (tracked source directory in this fork):
 
    ```bash
    cd frontend
-   npm install
+   npm ci
    npm run build
    cd ..
    ```
@@ -171,10 +174,12 @@ When adding new features, place code in the appropriate layer (handler → servi
 ### Current State
 
 - The repo has tests under `core/`, `database/`, `service/`, `sub/` and `util/`, using the
-  standard library `testing` package. There is no assertion library -- `t.Fatal` for setup
-  failures, `t.Errorf` for assertions.
-- `.github/workflows/test.yml` runs `gofmt`, `go vet`, the tests and the race detector on
-  every pull request.
+  standard library `testing` package. The local `deps/veepin` module needs its own test run.
+  Use `t.Fatal` for setup failures, `t.Errorf` for assertions.
+- `.github/workflows/test.yml` defines parallel formatting, backend test/race, and frontend
+  jobs for pull requests/manual or reusable invocation. It preserves local race guards;
+  it is not automatically a release gate. `l2tp-compat-test.yml` retains the isolated ICMP
+  regression and nested-module checks. Authoring a workflow does not mean it has passed.
 
 ### Running the Tests
 
@@ -193,8 +198,10 @@ Use `test`, not `dev`: `dev` adds the cronet tags, which need a toolchain only t
 workflow sets up. `test` is what the release builds for armv6, armv5 and s390x, so nothing
 goes uncovered.
 
-A check in `.github/workflows/test.yml` fails the build if a tag list is pasted inline
-anywhere outside `build-tags.sh`.
+Keep shared build-tag lists in `build-tags.sh`; the dedicated L2TP adapter workflow
+uses only `with_gvisor` for its focused package checks. Root module tests do not
+traverse `deps/veepin`. See [the upstream integration notes](upstream-1.6.8.md)
+for the source-only integration boundary and outstanding runtime verification.
 
 ### Writing Tests
 

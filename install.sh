@@ -73,6 +73,8 @@ check_release(){
         if [[ ${os_version} -lt 22 ]]; then
             echo -e "${Error} 请使用Ubuntu 22或以上版本!${Plain}\n" && exit 1
         fi
+    elif [[ "${release}" == "rhel" ]]; then
+        echo -e "${Info} 您的系统是 Red Hat Enterprise Linux${Plain}"
     elif [[ "${release}" == "fedora" ]]; then
         if [[ ${os_version} -lt 36 ]]; then
             echo -e "${Error} 请使用Fedora 36或以上版本!${Plain}\n" && exit 1
@@ -100,6 +102,7 @@ check_release(){
         echo "- Debian 12+"
         echo "- CentOS 9+"
         echo "- Fedora 36+"
+        echo "- Red Hat Enterprise Linux"
         echo "- Arch Linux"
         echo "- Parch Linux"
         echo "- Manjaro"
@@ -126,7 +129,7 @@ check_pmc(){
         updates="yum update -y"
         installs="yum install -y"
         apps=("wget" "curl" "tar" "openssl" )
-    elif [[ "$release" == "fedora" || "$release" == "amzn" ]]; then
+    elif [[ "$release" == "fedora" || "$release" == "amzn" || "$release" == "rhel" ]]; then
         updates="dnf update -y"
         installs="dnf install -y"
         apps=("wget" "curl" "tar" "openssl" )

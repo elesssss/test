@@ -32,26 +32,25 @@ func (s *SubHandler) subs(c *gin.Context) {
 	var result *string
 	var err error
 	subId := c.Param("subid")
-	format, isFormat := c.GetQuery("format")
-	if isFormat {
-		switch format {
-		case "json":
-			result, headers, err = s.JsonService.GetJson(subId, format)
-		case "clash":
-			result, headers, err = s.ClashService.GetClash(subId)
-		}
-		if err != nil || result == nil {
-			logger.Error(err)
-			c.String(400, "Error!")
-			return
-		}
-	} else {
+	format, valid := subscriptionFormat(c)
+	if !valid {
+		c.String(400, "Error!")
+		return
+	}
+	switch {
+	case format == "json":
+		result, headers, err = s.JsonService.GetJson(subId, format)
+	case format == "clash":
+		result, headers, err = s.ClashService.GetClash(subId)
+	case format == "happ":
+		result, headers, err = s.SubService.getSubs(subId, happLinks)
+	case format == "":
 		result, headers, err = s.SubService.GetSubs(subId)
-		if err != nil || result == nil {
-			logger.Error(err)
-			c.String(400, "Error!")
-			return
-		}
+	}
+	if err != nil || result == nil {
+		logger.Error(err)
+		c.String(400, "Error!")
+		return
 	}
 
 	s.addHeaders(c, headers)
@@ -59,12 +58,35 @@ func (s *SubHandler) subs(c *gin.Context) {
 	c.String(200, *result)
 }
 
+// subscriptionFormat is shared by GET and HEAD. An explicit format never
+// depends on the User-Agent, including when the explicit value is invalid.
+func subscriptionFormat(c *gin.Context) (string, bool) {
+	query := c.Request.URL.Query()
+	if query.Has("format") {
+		format := query.Get("format")
+		return format, format == "json" || format == "clash" || format == "happ"
+	}
+	for _, vary := range c.Writer.Header().Values("Vary") {
+		for _, field := range strings.Split(vary, ",") {
+			if strings.EqualFold(strings.TrimSpace(field), "User-Agent") || strings.TrimSpace(field) == "*" {
+				return formatForUserAgent(c.Request.UserAgent()), true
+			}
+		}
+	}
+	c.Writer.Header().Add("Vary", "User-Agent")
+	return formatForUserAgent(c.Request.UserAgent()), true
+}
+
 func (s *SubHandler) subHeaders(c *gin.Context) {
+	if _, valid := subscriptionFormat(c); !valid {
+		c.Status(400)
+		return
+	}
 	subId := c.Param("subid")
 	client, err := s.SubService.getClientBySubId(subId)
 	if err != nil {
 		logger.Error(err)
-		c.String(400, "Error!")
+		c.Status(400)
 		return
 	}
 

@@ -127,7 +127,26 @@ func (j *JsonService) getData(subId string) (*model.Client, []*model.Inbound, er
 	if err != nil {
 		return nil, nil, err
 	}
-	return client, inbounds, nil
+	enabled := inbounds[:0]
+	for _, inbound := range inbounds {
+		on, err := inbound.IsEnabled()
+		if err != nil {
+			return nil, nil, err
+		}
+		if on {
+			enabled = append(enabled, inbound)
+		}
+	}
+	return client, enabled, nil
+}
+
+// applyDefaultHost isolates transport changes for each advertised address.
+func applyDefaultHost(out map[string]interface{}) {
+	tls, _ := out["tls"].(map[string]interface{})
+	transport, _ := out["transport"].(map[string]interface{})
+	if host := util.DefaultTransportHost(transport, tls); host != "" {
+		out["transport"] = util.SetTransportHost(transport, host)
+	}
 }
 
 func (j *JsonService) getOutbounds(clientConfig json.RawMessage, inbounds []*model.Inbound, clientRemark string) (*[]map[string]interface{}, *[]string, error) {
@@ -203,6 +222,7 @@ func (j *JsonService) getOutbounds(clientConfig json.RawMessage, inbounds []*mod
 		// addresses have nothing to override.
 		_, viaRealm := outbound["realm"]
 		if len(addrs) == 0 || viaRealm {
+			applyDefaultHost(outbound)
 			tag = util.JoinRemark(clientRemark, tag)
 			takenTags[tag] = true
 			outbound["tag"] = tag
@@ -228,15 +248,20 @@ func (j *JsonService) getOutbounds(clientConfig json.RawMessage, inbounds []*mod
 
 				// Override TLS
 				if addrTls, ok := addr["tls"].(map[string]interface{}); ok {
-					outTls, _ := newOut["tls"].(map[string]interface{})
-					if outTls == nil {
-						outTls = make(map[string]interface{})
+					// Copy the inbound's TLS too: every address shares that map,
+					// so writing into it would give all of them the last
+					// address's server_name.
+					inTls, _ := newOut["tls"].(map[string]interface{})
+					outTls := make(map[string]interface{}, len(inTls)+len(addrTls))
+					for key, value := range inTls {
+						outTls[key] = value
 					}
 					for key, value := range addrTls {
 						outTls[key] = value
 					}
 					newOut["tls"] = outTls
 				}
+				applyDefaultHost(newOut)
 
 				remark, _ := addr["remark"].(string)
 				// Multiple addresses share one inbound tag, so the name only

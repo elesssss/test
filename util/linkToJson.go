@@ -1,6 +1,7 @@
 package util
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -32,11 +33,50 @@ func GetOutbound(uri string, i int) (*map[string]interface{}, string, error) {
 			return tuic(u, i)
 		case "ss", "shadowsocks":
 			return ss(u, i)
+		case "http", "https", "socks", "socks5":
+			return parseProxyLink(u, i)
 		case "naive+https", "naive+quic", "http2":
 			return parseNaiveLink(u, i)
 		}
 	}
 	return nil, "", common.NewError("Unsupported link format")
+}
+
+func parseProxyLink(u *url.URL, i int) (*map[string]interface{}, string, error) {
+	host := u.Hostname()
+	port, err := strconv.Atoi(u.Port())
+	if host == "" || err != nil || port < 1 || port > 65535 || u.Path != "" {
+		return nil, "", common.NewError("Invalid proxy link")
+	}
+	tag := u.Fragment
+	if tag == "" {
+		tag = net.JoinHostPort(host, u.Port())
+	}
+	if i > 0 {
+		tag = fmt.Sprintf("%d.%s", i, tag)
+	}
+	var username, password string
+	if u.User != nil {
+		username = u.User.Username()
+		password, _ = u.User.Password()
+	}
+	outbound := map[string]interface{}{
+		"type":        "http",
+		"tag":         tag,
+		"server":      host,
+		"server_port": port,
+		"username":    username,
+		"password":    password,
+	}
+	switch u.Scheme {
+	case "https":
+		query := u.Query()
+		outbound["tls"] = getTls("tls", &query)
+	case "socks", "socks5":
+		outbound["type"] = "socks"
+		outbound["version"] = "5"
+	}
+	return &outbound, tag, nil
 }
 
 func vmess(data string, i int) (*map[string]interface{}, string, error) {
@@ -106,6 +146,11 @@ func vmess(data string, i int) (*map[string]interface{}, string, error) {
 		}
 		if tls_insecure {
 			tls["insecure"] = true
+		}
+		if value, ok := dataJson["ech"].(string); ok {
+			if ech := echFromLink(value); ech != nil {
+				tls["ech"] = ech
+			}
 		}
 		if len(tls_fp) > 0 {
 			tls["utls"] = map[string]interface{}{
@@ -276,10 +321,18 @@ func hy2(u *url.URL, i int) (*map[string]interface{}, string, error) {
 	if up > 0 {
 		hy2["up_mbps"] = up
 	}
-	if obfs == "salamander" {
+	if obfs == "salamander" || obfs == "gecko" {
 		hy2["obfs"] = map[string]interface{}{
-			"type":     "salamander",
+			"type":     obfs,
 			"password": query.Get("obfs-password"),
+		}
+		if obfs == "gecko" {
+			options := hy2["obfs"].(map[string]interface{})
+			for _, key := range []string{"min_packet_size", "max_packet_size"} {
+				if size, err := strconv.Atoi(query.Get("obfs-" + strings.ReplaceAll(key, "_", "-"))); err == nil && size > 0 {
+					options[key] = float64(size)
+				}
+			}
 		}
 	}
 	if len(mport) > 0 {
@@ -556,7 +609,7 @@ func getTransport(tp_type string, q *url.Values) map[string]interface{} {
 	return transport
 }
 
-// GetOutboundForClash preserves XHTTP only for the Clash YAML export path.
+// GetOutboundForClash preserves VLESS encryption and XHTTP for Clash YAML exports.
 // Regular external links for Happ and sing-box JSON exports stay unchanged.
 func GetOutboundForClash(uri string, i int) (*map[string]interface{}, string, error) {
 	outbound, tag, err := GetOutbound(uri, i)
@@ -568,6 +621,9 @@ func GetOutboundForClash(uri string, i int) (*map[string]interface{}, string, er
 		return outbound, tag, err
 	}
 	q := u.Query()
+	if encryption := q.Get("encryption"); encryption != "" {
+		(*outbound)["encryption"] = encryption
+	}
 	tp := strings.ToLower(q.Get("type"))
 	if tp != "xhttp" && tp != "splithttp" {
 		return outbound, tag, err
@@ -628,16 +684,36 @@ func getTls(security string, q *url.Values) map[string]interface{} {
 			"fingerprint": tls_fp,
 		}
 	}
-	if len(tls_ech) > 0 {
-		tls["ech"] = map[string]interface{}{
-			"enabled": true,
-			"config": []string{
-				tls_ech,
-			},
-		}
+	if ech := echFromLink(tls_ech); ech != nil {
+		tls["ech"] = ech
 	}
 	if disable_sni == "1" || disable_sni == "true" {
 		tls["disable_sni"] = true
 	}
 	return tls
+}
+
+// echFromLink reads a link's ech value: the base64 ECHConfigList, which
+// sing-box takes as a PEM block, or Xray's "domain+DNS" form, whose domain is
+// where the config is looked up instead.
+func echFromLink(value string) map[string]interface{} {
+	// A raw + in the query decodes to a space
+	value = strings.ReplaceAll(strings.TrimSpace(value), " ", "+")
+	if value == "" {
+		return nil
+	}
+	if list, err := base64.StdEncoding.DecodeString(value); err == nil &&
+		len(list) > 2 && int(list[0])<<8|int(list[1]) == len(list)-2 {
+		return map[string]interface{}{
+			"enabled": true,
+			"config":  []string{"-----BEGIN ECH CONFIGS-----", value, "-----END ECH CONFIGS-----"},
+		}
+	}
+	if name, _, found := strings.Cut(value, "+"); found && strings.Contains(name, ".") {
+		return map[string]interface{}{
+			"enabled":           true,
+			"query_server_name": name,
+		}
+	}
+	return nil
 }

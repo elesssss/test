@@ -66,11 +66,11 @@
               <v-col style="text-align: center;">
                 <v-chip>{{ $t('setting.jsonSub') }}</v-chip><br>
                 <QrcodeVue
-                  :value="clientSub + '?format=json'"
+                  :value="jsonSub"
                   :size="size"
                   :margin="1"
                   style="border-radius: 1rem; cursor: copy;"
-                  @click="copyToClipboard(clientSub + '?format=json')"
+                  @click="copyToClipboard(jsonSub)"
                 />
               </v-col>
             </v-row>
@@ -78,11 +78,22 @@
               <v-col style="text-align: center;">
                 <v-chip>{{ $t('setting.clashSub') }}</v-chip><br>
                 <QrcodeVue
-                  :value="clientSub + '?format=clash'"
+                  :value="clashSub"
                   :size="size"
                   :margin="1"
                   style="border-radius: 1rem; cursor: copy;"
-                  @click="copyToClipboard(clientSub + '?format=clash')"
+                  @click="copyToClipboard(clashSub)"
+                />
+              </v-col>
+            </v-row>
+            <v-row>
+              <v-col style="text-align: center;">
+                <v-chip>HAPP (scan only)</v-chip><br>
+                <QrcodeVue
+                  :value="happ"
+                  :size="size"
+                  :margin="1"
+                  style="border-radius: .8rem; cursor: not-allowed;"
                 />
               </v-col>
             </v-row>
@@ -150,6 +161,7 @@ import { push } from 'notivue'
 import { Client } from '@/types/clients'
 import type { Inbound } from '@/types/inbounds'
 import { l2tpConnectionLinks } from '@/plugins/l2tpConnection'
+import { subscriptionURL, happSubscriptionURL } from '@/plugins/subscription'
 
 export default {
   components: { QrcodeVue },
@@ -171,9 +183,17 @@ export default {
     clientSub() {
       return Data().subURI + this.client.name
     },
+    jsonSub() {
+      return subscriptionURL(this.clientSub, 'json')
+    },
+    clashSub() {
+      return subscriptionURL(this.clientSub, 'clash')
+    },
+    happ() {
+      return happSubscriptionURL(this.clientSub)
+    },
     singbox() {
-      const url = Data().subURI + this.client.name + "?format=json"
-      return "sing-box://import-remote-profile?url=" +  encodeURIComponent(url) + "#" + this.client.name
+      return "sing-box://import-remote-profile?url=" + encodeURIComponent(this.jsonSub) + "#" + this.client.name
     },
     clientLinks() {
       return this.client.links?? []

@@ -2,6 +2,7 @@ package sub
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -18,8 +19,10 @@ type SubService struct {
 }
 
 func (s *SubService) GetSubs(subId string) (*string, []string, error) {
-	var err error
+	return s.getSubs(subId, nil)
+}
 
+func (s *SubService) getSubs(subId string, transform func([]string) []string) (*string, []string, error) {
 	client, err := s.getClientBySubId(subId)
 	if err != nil {
 		return nil, nil, err
@@ -31,7 +34,14 @@ func (s *SubService) GetSubs(subId string) (*string, []string, error) {
 		clientInfo = s.getClientInfo(client)
 	}
 
-	linksArray := s.LinkService.GetLinks(&client.Links, "all", clientInfo)
+	links, err := dropDisabledLinks(client)
+	if err != nil {
+		return nil, nil, err
+	}
+	linksArray := s.LinkService.GetLinks(&links, "all", clientInfo)
+	if transform != nil {
+		linksArray = transform(linksArray)
+	}
 	result := strings.Join(linksArray, "\n")
 
 	headers := s.getClientHeaders(client)
@@ -42,6 +52,42 @@ func (s *SubService) GetSubs(subId string) (*string, []string, error) {
 	}
 
 	return &result, headers, nil
+}
+
+// dropDisabledLinks removes the local links of disabled inbounds. They stay
+// stored on the client so that enabling the inbound again brings them back.
+func dropDisabledLinks(client *model.Client) (json.RawMessage, error) {
+	var ids []uint
+	if err := json.Unmarshal(client.Inbounds, &ids); len(client.Inbounds) > 0 && err != nil {
+		return nil, err
+	}
+	var inbounds []model.Inbound
+	if len(ids) > 0 {
+		if err := database.GetDB().Where("id in ?", ids).Find(&inbounds).Error; err != nil {
+			return nil, err
+		}
+	}
+	disabled := make(map[string]bool)
+	for _, inbound := range inbounds {
+		enabled, err := inbound.IsEnabled()
+		if err != nil {
+			return nil, err
+		}
+		if !enabled {
+			disabled[inbound.Tag] = true
+		}
+	}
+	var links []Link
+	if err := json.Unmarshal(client.Links, &links); len(client.Links) > 0 && err != nil {
+		return nil, err
+	}
+	kept := links[:0]
+	for _, link := range links {
+		if link.Type != "local" || !disabled[link.Remark] {
+			kept = append(kept, link)
+		}
+	}
+	return json.Marshal(kept)
 }
 
 func (j *SubService) getClientBySubId(subId string) (*model.Client, error) {

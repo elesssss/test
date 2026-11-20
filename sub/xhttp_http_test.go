@@ -119,7 +119,7 @@ func TestXHTTPSubscriptionHTTPPipeline(t *testing.T) {
 				t.Fatal("External Subs HTTP Clash response differs from direct External Links")
 			}
 
-			for _, userAgent := range []string{"HTTP-smoke", "Happ/1.0"} {
+			for _, userAgent := range []string{"HTTP-smoke", "Happ/1.0", "HappyClient/1.0"} {
 				raw := request(t, client.Name, "", userAgent)
 				if encoded {
 					decoded, err := base64.StdEncoding.DecodeString(string(raw))
@@ -129,7 +129,7 @@ func TestXHTTPSubscriptionHTTPPipeline(t *testing.T) {
 					raw = decoded
 				}
 				if string(raw) != plain {
-					t.Fatalf("%s raw/Happ response changed source URIs", userAgent)
+					t.Fatalf("%s raw/XHTTP Happ response changed source URIs", userAgent)
 				}
 			}
 			var jsonConfig map[string]interface{}

@@ -28,11 +28,10 @@ jobs:
     outputs:
       version: ${{ steps.set-version.outputs.version }}
     steps:
-      - name: Checkout frontend submodule
+      - name: Checkout repository with tracked frontend
         uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
-          submodules: recursive
 
       - name: Validate release version
         id: set-version

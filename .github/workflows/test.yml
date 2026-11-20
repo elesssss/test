@@ -1,0 +1,94 @@
+name: Source regression
+
+# This workflow is authored here, not run during the source-only integration.
+on:
+  workflow_dispatch:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  formatting:
+    name: Go formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Check tracked Go sources
+        run: |
+          set -euo pipefail
+          unformatted=$(git ls-files -z '*.go' ':!:frontend/**' | xargs -0 gofmt -l)
+          if [ -n "$unformatted" ]; then
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
+
+  backend:
+    name: Backend (${{ matrix.profile }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [test, race]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            deps/veepin/go.sum
+      - name: Build frontend embedding fixture
+        run: |
+          mkdir -p web/html
+          printf '<!doctype html><title>Test fixture</title>' > web/html/index.html
+      - name: Backend regression
+        env:
+          PROFILE: ${{ matrix.profile }}
+          CGO_ENABLED: '1'
+        run: |
+          set -euo pipefail
+          . ./build-tags.sh
+          TAGS=$(tags_for test)
+          FLAGS=$(ldflags_for test)
+          if [ "$PROFILE" = race ]; then
+            # Keep the local race guards; upstream success does not certify our core.
+            go test -mod=readonly -race -short -tags "$TAGS" -ldflags "$FLAGS" ./...
+          else
+            go vet -mod=readonly -tags "$TAGS" ./...
+            go test -mod=readonly -tags "$TAGS" -ldflags "$FLAGS" ./...
+          fi
+      - name: Nested module regression
+        working-directory: deps/veepin
+        env:
+          PROFILE: ${{ matrix.profile }}
+        run: |
+          set -euo pipefail
+          if [ "$PROFILE" = race ]; then
+            go test -mod=readonly -race -short ./internal/cryptoutil ./internal/ikev1 ./internal/ikev2/esp ./internal/ppp ./internal/l2tp ./l2tp
+          else
+            go test -mod=readonly ./internal/cryptoutil ./internal/ikev1 ./internal/ikev2/esp ./internal/ppp ./internal/l2tp ./l2tp
+          fi
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Frontend regression
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run test
+          npm run lint
+          npm run build

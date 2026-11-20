@@ -130,6 +130,11 @@ func prepareTls(t *model.Tls) map[string]interface{} {
 		oTls["pinSHA256"] = CertSha256Hex(CertPEMFromTLS(iTls))
 	}
 
+	if clientEch, ok := oTls["ech"].(map[string]interface{}); ok {
+		serverEch, _ := iTls["ech"].(map[string]interface{})
+		clientEch["enabled"] = boolOr(serverEch["enabled"])
+	}
+
 	for k, v := range iTls {
 		switch k {
 		case "enabled", "server_name", "alpn":
@@ -397,6 +402,13 @@ func hysteria2Link(
 			if obfsPassword, ok := obfs["password"].(string); ok {
 				params = append(params, LinkParam{"obfs-password", obfsPassword})
 			}
+			if obfs["type"] == "gecko" {
+				for _, key := range []string{"min_packet_size", "max_packet_size"} {
+					if size, ok := obfs[key].(float64); ok && size > 0 {
+						params = append(params, LinkParam{"obfs-" + strings.ReplaceAll(key, "_", "-"), fmt.Sprintf("%.0f", size)})
+					}
+				}
+			}
 		}
 		if tfo, ok := inbound["tcp_fast_open"].(bool); ok && tfo {
 			params = append(params, LinkParam{"fastopen", "1"})
@@ -490,6 +502,9 @@ func vlessLink(
 		copy(params, baseParams)
 		if tls, ok := addr["tls"].(map[string]interface{}); ok && boolOr(tls["enabled"]) {
 			getTlsParams(&params, tls, "vless")
+			if host := DefaultTransportHost(inbound["transport"], tls); host != "" {
+				params = append(params, LinkParam{"host", host})
+			}
 			if flow, ok := userConfig["flow"].(string); ok && isTcp {
 				params = append(params, LinkParam{"flow", flow})
 			}
@@ -515,6 +530,9 @@ func trojanLink(
 		copy(params, baseParams)
 		if tls, ok := addr["tls"].(map[string]interface{}); ok && boolOr(tls["enabled"]) {
 			getTlsParams(&params, tls, "trojan")
+			if host := DefaultTransportHost(inbound["transport"], tls); host != "" {
+				params = append(params, LinkParam{"host", host})
+			}
 		}
 		port, _ := addr["server_port"].(float64)
 		links = append(links, linkURL("trojan", url.User(password),
@@ -587,6 +605,11 @@ func vmessLink(
 			obj["path"] = path
 		}
 		populateVmessTlsParams(obj, addr["tls"])
+		if tls, ok := addr["tls"].(map[string]interface{}); ok && boolOr(tls["enabled"]) {
+			if defaultHost := DefaultTransportHost(inbound["transport"], tls); defaultHost != "" {
+				obj["host"] = defaultHost
+			}
+		}
 
 		jsonStr, _ := json.Marshal(obj)
 
@@ -613,6 +636,8 @@ func populateVmessTlsParams(obj map[string]interface{}, tlsConfig interface{}) {
 				obj["fp"] = p.Value
 			case "alpn":
 				obj["alpn"] = p.Value
+			case "ech":
+				obj["ech"] = p.Value
 			}
 		}
 	} else {
@@ -739,7 +764,7 @@ func getTransportParams(t interface{}) []LinkParam {
 			params = append(params, LinkParam{"path", path})
 		}
 		if headers, ok := trasport["headers"].(map[string]interface{}); ok {
-			if host, ok := headers["Host"].(string); ok {
+			if host, ok := headers["Host"].(string); ok && host != "" {
 				params = append(params, LinkParam{"host", host})
 			}
 		}
@@ -748,7 +773,7 @@ func getTransportParams(t interface{}) []LinkParam {
 			params = append(params, LinkParam{"serviceName", serviceName})
 		}
 	case "httpupgrade":
-		if host, ok := trasport["host"].(string); ok {
+		if host, ok := trasport["host"].(string); ok && host != "" {
 			params = append(params, LinkParam{"host", host})
 		}
 		if path, ok := trasport["path"].(string); ok {
@@ -756,6 +781,89 @@ func getTransportParams(t interface{}) []LinkParam {
 		}
 	}
 	return params
+}
+
+// DefaultTransportHost returns the Host a ws or httpupgrade transport should
+// send when it names none, which is the TLS server_name. Left empty, sing-box
+// sends the server address, and a CDN reached through a clean IP domain answers
+// that with 403 because the Host belongs to no site on its side. It returns ""
+// when the transport already has a Host, TLS is off, or there is no server_name
+// to use.
+func DefaultTransportHost(transport interface{}, tls map[string]interface{}) string {
+	if !boolOr(tls["enabled"]) {
+		return ""
+	}
+	t, _ := transport.(map[string]interface{})
+	transportType, _ := t["type"].(string)
+	if transportType != "ws" && transportType != "httpupgrade" {
+		return ""
+	}
+	if host, _ := t["host"].(string); host != "" {
+		return ""
+	}
+	if headers, ok := t["headers"].(map[string]interface{}); ok {
+		switch host := headers["Host"].(type) {
+		case string:
+			if host != "" {
+				return ""
+			}
+		case []interface{}:
+			if len(host) > 0 {
+				return ""
+			}
+		}
+	}
+	serverName, _ := tls["server_name"].(string)
+	return serverName
+}
+
+// SetTransportHost returns a copy of transport with host set, in the field
+// sing-box reads for that transport type. It copies because the addresses of
+// one inbound share the transport map.
+func SetTransportHost(transport map[string]interface{}, host string) map[string]interface{} {
+	out := make(map[string]interface{}, len(transport)+1)
+	for key, value := range transport {
+		out[key] = value
+	}
+	if out["type"] == "httpupgrade" {
+		out["host"] = host
+		return out
+	}
+	headers := map[string]interface{}{"Host": host}
+	if old, ok := transport["headers"].(map[string]interface{}); ok {
+		for key, value := range old {
+			if key != "Host" {
+				headers[key] = value
+			}
+		}
+	}
+	out["headers"] = headers
+	return out
+}
+
+// ECHConfigBase64 returns the ECHConfigList a client config stores as PEM
+// lines, as the bare base64 that share links and Clash carry.
+func ECHConfigBase64(config interface{}) string {
+	var lines []string
+	switch value := config.(type) {
+	case []string:
+		lines = value
+	case []interface{}:
+		for _, line := range value {
+			if text, ok := line.(string); ok {
+				lines = append(lines, text)
+			}
+		}
+	}
+	var b strings.Builder
+	for _, line := range lines {
+		s := strings.TrimSpace(line)
+		if strings.HasPrefix(s, "-----") {
+			continue
+		}
+		b.WriteString(s)
+	}
+	return b.String()
 }
 
 func getTlsParams(params *[]LinkParam, tls map[string]interface{}, protocol string) {
@@ -777,6 +885,11 @@ func getTlsParams(params *[]LinkParam, tls map[string]interface{}, protocol stri
 		}
 		if disableSni, ok := tls["disable_sni"].(bool); ok && disableSni {
 			*params = append(*params, LinkParam{"disable_sni", "1"})
+		}
+		if ech, ok := tls["ech"].(map[string]interface{}); ok && boolOr(ech["enabled"]) {
+			if config := ECHConfigBase64(ech["config"]); config != "" {
+				*params = append(*params, LinkParam{"ech", config})
+			}
 		}
 	}
 	if utls, ok := tls["utls"].(map[string]interface{}); ok {

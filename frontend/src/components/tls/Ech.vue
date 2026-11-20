@@ -48,7 +48,7 @@
             density="compact"
             icon="mdi-key-star"
             :loading="loading"
-            @click="genECH"
+            @click="genDialog = true"
           >
             <v-icon />
             <v-tooltip
@@ -87,7 +87,10 @@
           <v-text-field
             v-model="oTls.ech.query_server_name"
             :label="$t('tls.queryServerName')"
-            hide-details
+            :disabled="hasConfig"
+            :hint="hasConfig ? $t('tls.echQueryDisabled') : ''"
+            :persistent-hint="hasConfig"
+            :hide-details="!hasConfig"
             placeholder="ech.example.com"
           />
         </v-col>
@@ -102,6 +105,50 @@
         </v-col>
       </v-row>
     </template>
+    <v-dialog
+      v-model="genDialog"
+      max-width="520"
+    >
+      <v-card :title="$t('tls.echPublicName')">
+        <v-divider />
+        <v-card-text>
+          <p class="mb-3">
+            {{ $t('tls.echPublicNameAbout') }}
+          </p>
+          <p class="mb-4 text-medium-emphasis">
+            {{ $t('tls.echQueryAbout') }}
+          </p>
+          <v-text-field
+            v-model="publicName"
+            :label="$t('tls.echPublicName')"
+            placeholder="public.example.com"
+            dir="ltr"
+            hide-details
+            autofocus
+            @keyup.enter="genECH"
+          />
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn
+            color="primary"
+            variant="outlined"
+            @click="genDialog = false"
+          >
+            {{ $t('actions.close') }}
+          </v-btn>
+          <v-btn
+            color="primary"
+            variant="tonal"
+            :loading="loading"
+            :disabled="publicName.trim() == ''"
+            @click="genECH"
+          >
+            {{ $t('actions.generate') }}
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
   </v-card>
 </template>
 
@@ -111,6 +158,7 @@ import { i18n } from '@/locales'
 import HttpUtils from '@/plugins/httputil'
 import { iTls as ITlsOptions, oTls as OTlsOptions } from '@/types/tls'
 import { push } from 'notivue'
+import { parseECHKeypair } from '@/plugins/ech'
 
 // Only the ECH fields this form reads or writes on the server half of a TLS
 // config.
@@ -145,6 +193,11 @@ const oTls = computed(() => oTlsModel.value as unknown as EchOutTls)
 
 const useEchPath = ref(iTls.value?.ech?.key ? 1 : 0)
 const loading = ref(false)
+// The cleartext outer SNI baked into the generated config. It is only an
+// input to the generator, asked for when generating; sing-box keeps no field
+// for it.
+const genDialog = ref(false)
+const publicName = ref('')
 
 const ech = computed(() => iTls.value.ech as NonNullable<EchInTls['ech']>)
 // The client half is written whenever the server half is, so it is present
@@ -164,57 +217,38 @@ const echKeyText = computed({
   set: (newValue: string) => { ech.value.key = newValue.split('\n') },
 })
 
+// A client with a config uses it and never looks one up, so the query name
+// only matters while the config is empty.
+const hasConfig = computed((): boolean => (oTls.value.ech?.config ?? []).some(l => l.trim() != ''))
+
 const echConfigText = computed({
   get: (): string => oTls.value.ech?.config ? oTls.value.ech.config.join('\n') : '',
   set: (newValue: string) => { oEch.value.config = newValue.split('\n') },
 })
 
 async function genECH() {
+  const name = publicName.value.trim()
+  if (!name || loading.value || !enabled.value) return
+  // Do not apply an answer after the form was disabled or replaced.
+  const server = iTls.value.ech
+  const client = oTls.value.ech
   loading.value = true
-  // The endpoint answers with the generated PEM blocks, one line per entry.
-  const msg = await HttpUtils.get<string[]>('api/keypairs', {
-    k: "ech",
-    o: iTls.value.server_name ?? "''"
-  })
-  loading.value = false
-  if (msg.success && iTls.value.ech && oTls.value.ech) {
-    iTls.value.ech.key_path = undefined
-    useEchPath.value = 1
-    if (msg.obj.length > 0) {
-      let config = <string[]>[]
-      let key = <string[]>[]
-      let isConfig = false
-      let isKey = false
-
-      msg.obj.forEach((line: string) => {
-        if (line === "-----BEGIN ECH CONFIGS-----") {
-          isConfig = true
-          isKey = false
-          config.push(line)
-        } else if (line === "-----END ECH CONFIGS-----") {
-          isConfig = false
-          config.push(line)
-        } else if (line === "-----BEGIN ECH KEYS-----") {
-          isKey = true
-          isConfig = false
-          key.push(line)
-        } else if (line === "-----END ECH KEYS-----") {
-          isKey = false
-          key.push(line)
-        } else if (isConfig) {
-          config.push(line)
-        } else if (isKey) {
-          key.push(line)
-        }
-      })
-      iTls.value.ech.key = key ?? undefined
-      oTls.value.ech.config = config ?? undefined
-
-    } else {
-      push.error({
-        message: i18n.global.t('error') + ": " + msg.obj
-      })
+  try {
+    const msg = await HttpUtils.get<string[]>('api/keypairs', { k: 'ech', o: name })
+    if (!enabled.value || iTls.value.ech !== server || oTls.value.ech !== client) return
+    const pair = msg.success ? parseECHKeypair(msg.obj) : undefined
+    if (!pair || !server || !client) {
+      push.error({ message: i18n.global.t('error') })
+      return
     }
+    server.key = pair.key
+    delete server.key_path
+    client.config = pair.config
+    delete client.query_server_name
+    useEchPath.value = 1
+    genDialog.value = false
+  } finally {
+    loading.value = false
   }
 }
 </script>

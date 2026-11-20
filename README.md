@@ -1,5 +1,11 @@
 # S-UI
 
+### 上游 v1.6.8 功能同步（源码阶段）
+
+已选择性合入上游前后端的 Happ/UA 订阅选择、HTTP(S)/SOCKS5 链接、禁用入站订阅过滤、Hysteria2 Gecko、Snell 多地址入口、ECH/WS/VLESS 订阅保留修复、内核版本显示、WireGuard 空端口及 RHEL 分支，保留本地 L2TP/ICMP、策略热更新和更新回滚。
+
+**尚未编译或运行测试，也未生成前端产物。** 面板 IP/无 SNI TLS 例外、批量依赖更新和上游扫描配置未合入；固定目标提交、取舍和待验证项见 [合并记录](upstream-1.6.8.md)。本项目版本号和更新源没有切换到上游。
+
 ### 本版本的 L2TP/IPsec 功能
 
 本版本移植了 [wanan9999/s-ui](https://github.com/wanan9999/s-ui) 的 L2TP 适配器，并保留原版前端的主题和布局。L2TP 依赖基于固定版本的 [wanan9999/veepin](https://github.com/wanan9999/veepin)，所需源码和爱快兼容补丁保存在 `deps/veepin`，通过 `go.mod` 的本地替换参与构建；来源、补丁范围和测试命令见 [依赖说明](deps/veepin/README.s-ui.md)。

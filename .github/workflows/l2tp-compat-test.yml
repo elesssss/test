@@ -28,7 +28,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          cache-dependency-path: deps/veepin/go.sum
+          cache-dependency-path: |
+            go.sum
+            deps/veepin/go.sum
       - name: Check patch formatting
         run: |
           test -z "$(gofmt -l deps/veepin/internal/l2tp/*.go core/protocol/l2tp/*.go deps/veepin/internal/ikev1/ikuai*.go deps/veepin/internal/ikev1/diagnostics*.go deps/veepin/l2tp/server_udp_linux_test.go deps/veepin/internal/cryptoutil/modp3072_test.go)"
